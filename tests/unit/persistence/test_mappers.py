@@ -187,6 +187,20 @@ def test_invalid_row_values_are_rejected_before_or_by_domain_reconstitution() ->
         attempt_from_row(row)
 
 
+def test_invalid_task_and_attempt_state_combinations_reach_domain_reconstitution() -> (
+    None
+):
+    task_row = task_to_row(task())
+    task_row.status = "READY"
+    with pytest.raises(DomainError):
+        task_from_row(task_row)
+
+    attempt_row = attempt_to_row(attempt())
+    attempt_row.status = "COMPLETED"
+    with pytest.raises(DomainError):
+        attempt_from_row(attempt_row)
+
+
 def test_only_mapper_production_code_calls_reconstitute() -> None:
     source_root = Path("src")
     callers = [

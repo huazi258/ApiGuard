@@ -1,15 +1,42 @@
 # ApiGuard
 
-ApiGuard V0 will turn confirmed OpenAPI contract requirements and explicit business
-rules into bounded, reproducible API verification evidence. It is intended for
+ApiGuard V0 converts confirmed OpenAPI contract requirements and explicit business
+rules into bounded, reproducible API verification evidence. It is designed for
 local and test environments, not production.
 
 ## Current milestone
 
-Milestone 1 currently includes M1-01 (quality gates) and M1-02 (configuration,
-logging, and the FastAPI process-health shell). No domain model, state machine,
-database, HTTP executor, model integration, or product web interface has been
-implemented.
+Milestone 1 is complete. It established the project quality gates, process shell,
+shared domain types, and the task and attempt lifecycle state machines.
+
+| Task | Result | Commit |
+| --- | --- | --- |
+| M1-01 | Python repository and quality gates | `cf3907c9e5b7adb1a2964e695444c1feaae62a4f` |
+| M1-02 | Settings, logging, FastAPI shell, and `/health` | `c42e8a9275af35eacc88b70c29cd1670097a91bf` |
+| M1-03 | Shared enums, IDs, and errors | `9e24836e85803f25d924a299e055be37c6a93ae1` |
+| M1-04 | VerificationTask lifecycle | `7c82b86280156277d0fa8e078001a51147399344` |
+| M1-05 | ValidationAttempt lifecycle | `9a26ef5d710144382796bd4c370fa50f1ae0f35c` |
+| M1-06 | Baseline archiving and milestone documentation | This commit |
+
+The PowerShell documentation-only correction is `ab88a5c92f15683ef787a1d17a500f8e8a844b17`; it is not a separate milestone task.
+
+### Implemented in milestone 1
+
+- Python 3.12 project, uv lockfile, pytest, Ruff, and Pyright quality gates.
+- FastAPI process shell and process-only `GET /health` endpoint.
+- Frozen shared enums, strong nominal ID types, and minimal domain errors.
+- VerificationTask preparation, confirmation, and cancellation lifecycle.
+- ValidationAttempt execution/completion lifecycle and three-send hard limit.
+
+### Not implemented
+
+- SQLite business persistence and migrations.
+- OpenAPI parsing, plan models, and plan validation.
+- HTTP execution and deterministic evaluation.
+- Model calls, product API, and Jinja2 pages.
+- EvidenceBundle contents, derived reports, and startup recovery.
+
+Milestone 2, SQLite persistence and migration foundations, has not started.
 
 ## Requirements
 
@@ -48,3 +75,27 @@ uv run uvicorn apiguard.main:app
 The project uses a `src/` layout. Runtime dependencies are FastAPI,
 pydantic-settings, and Uvicorn; pytest, Ruff, Pyright, and HTTPX (for FastAPI's
 TestClient) are development dependencies managed by uv.
+
+## Frozen project documents
+
+- [V0 scope baseline](docs/baselines/00-v0-scope.md)
+- [V0 architecture baseline](docs/baselines/01-v0-architecture.md)
+- [V0 technical design and development baseline](docs/baselines/02-v0-technical-design-and-development.md)
+- [Milestone 1 task cards](docs/codex/milestone-01-task-cards.md)
+
+The technical design baseline preserves the frozen implementation naming:
+`EvidencePackage` is implemented as `EvidenceBundle`, and `HumanReadableReport`
+is implemented as `DerivedReport`; their business meaning and authority boundary
+do not change.
+
+## Facts and evidence
+
+```text
+仓库代码、迁移、测试和真实运行结果
+> 仓库中的冻结基线与任务说明
+> Codex 完成报告
+> 聊天记录
+```
+
+Chat is not the source of truth for project behavior or design. ApiGuard does not
+yet execute real API verification tasks.

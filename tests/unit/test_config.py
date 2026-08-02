@@ -1,5 +1,7 @@
 """Tests for application configuration."""
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -34,6 +36,16 @@ def test_settings_allow_non_secret_environment_override(
     settings = Settings()
 
     assert settings.target_http_request_timeout_seconds == 30
+
+
+def test_settings_use_and_override_database_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert Settings().database_path == Path("data/apiguard.db")
+
+    monkeypatch.setenv("APIGUARD_DATABASE_PATH", "test-data/apiguard.db")
+
+    assert Settings().database_path == Path("test-data/apiguard.db")
 
 
 @pytest.mark.parametrize(

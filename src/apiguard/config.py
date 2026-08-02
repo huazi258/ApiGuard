@@ -1,5 +1,6 @@
 """Application configuration and frozen V0 safety budgets."""
 
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
@@ -15,6 +16,7 @@ class Settings(BaseSettings):
 
     app_title: str = "ApiGuard"
     log_level: LogLevel = "INFO"
+    database_path: Path = Path("data/apiguard.db")
 
     openapi_fetch_timeout_seconds: int = Field(default=10, gt=0)
     max_openapi_fetch_attempts: int = Field(default=2, gt=0)

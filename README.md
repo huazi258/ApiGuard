@@ -6,8 +6,12 @@ local and test environments, not production.
 
 ## Current milestone
 
-Milestone 1 is complete. It established the project quality gates, process shell,
-shared domain types, and the task and attempt lifecycle state machines.
+Milestone 1 is complete. Milestone 2 has established the SQLite schema and its
+initial migration foundation; mapper, Repository, Unit of Work, and business
+persistence are still not implemented.
+
+- M2-01: domain entity reconstitution is complete.
+- M2-02: SQLite schema and the initial Alembic migration are complete.
 
 | Task | Result | Commit |
 | --- | --- | --- |
@@ -28,15 +32,33 @@ The PowerShell documentation-only correction is `ab88a5c92f15683ef787a1d17a500f8
 - VerificationTask preparation, confirmation, and cancellation lifecycle.
 - ValidationAttempt execution/completion lifecycle and three-send hard limit.
 
+### Current persistence foundation
+
+- SQLite file path configuration: `APIGUARD_DATABASE_PATH` (default
+  `data/apiguard.db`).
+- One SQLAlchemy Metadata with eleven structural ORM Row tables and one Alembic
+  initial migration.
+- File-backed SQLite connections use foreign keys, WAL, synchronous NORMAL, and
+  a five-second busy timeout.
+
+Apply the schema explicitly; application startup never migrates a database:
+
+```bash
+uv run alembic upgrade head
+```
+
+`/health` remains process-only and does not connect to SQLite.
+
 ### Not implemented
 
-- SQLite business persistence and migrations.
+- Row/domain mappers, Repository, Unit of Work, and business persistence.
 - OpenAPI parsing, plan models, and plan validation.
 - HTTP execution and deterministic evaluation.
 - Model calls, product API, and Jinja2 pages.
 - EvidenceBundle contents, derived reports, and startup recovery.
 
-Milestone 2, SQLite persistence and migration foundations, has not started.
+Milestone 2 persistence work is in progress; its next task is not started by
+this schema-only change.
 
 ## Requirements
 
@@ -67,14 +89,15 @@ Non-secret settings use the `APIGUARD_` environment-variable prefix. For example
 
 ```bash
 $env:APIGUARD_TARGET_HTTP_REQUEST_TIMEOUT_SECONDS = "30"
+$env:APIGUARD_DATABASE_PATH = "data/apiguard.db"
 uv run uvicorn apiguard.main:app
 ```
 
 ## Package layout
 
 The project uses a `src/` layout. Runtime dependencies are FastAPI,
-pydantic-settings, and Uvicorn; pytest, Ruff, Pyright, and HTTPX (for FastAPI's
-TestClient) are development dependencies managed by uv.
+pydantic-settings, Uvicorn, SQLAlchemy 2.x, and Alembic; pytest, Ruff, Pyright,
+and HTTPX (for FastAPI's TestClient) are development dependencies managed by uv.
 
 ## Frozen project documents
 

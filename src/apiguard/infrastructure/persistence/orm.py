@@ -9,6 +9,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -48,7 +49,7 @@ class VerificationTaskRow(Base):
         ForeignKeyConstraint(
             ["task_id", "current_confirmed_plan_id"],
             ["validation_plan_snapshots.task_id", "validation_plan_snapshots.plan_id"],
-            name="current_confirmed_plan",
+            name="fk_verification_tasks_current_confirmed_plan",
         ),
     )
 
@@ -74,8 +75,14 @@ class VerificationTaskRow(Base):
 class OpenAPISnapshotRow(Base):
     __tablename__ = "openapi_snapshots"
     __table_args__ = (
-        UniqueConstraint("task_id", "version_no", name="task_version"),
-        UniqueConstraint("task_id", "openapi_snapshot_id", name="task_snapshot"),
+        UniqueConstraint(
+            "task_id", "version_no", name="uq_openapi_snapshots_task_version"
+        ),
+        UniqueConstraint(
+            "task_id",
+            "openapi_snapshot_id",
+            name="uq_openapi_snapshots_task_snapshot",
+        ),
         CheckConstraint("version_no > 0", name="version_positive"),
         CheckConstraint("raw_size_bytes >= 0", name="raw_size_nonnegative"),
         CheckConstraint(
@@ -105,7 +112,11 @@ class OpenAPISnapshotRow(Base):
 class ModelCallRecordRow(Base):
     __tablename__ = "model_call_records"
     __table_args__ = (
-        UniqueConstraint("preparation_run_id", "call_sequence", name="run_sequence"),
+        UniqueConstraint(
+            "preparation_run_id",
+            "call_sequence",
+            name="uq_model_call_records_run_sequence",
+        ),
         CheckConstraint("call_sequence > 0", name="call_sequence_positive"),
         CheckConstraint(
             "call_kind IN ('PRIMARY', 'TRANSIENT_RETRY', 'FORMAT_REPAIR')",
@@ -143,7 +154,11 @@ class ModelCallRecordRow(Base):
 class NormalizedRuleRow(Base):
     __tablename__ = "normalized_rules"
     __table_args__ = (
-        UniqueConstraint("task_id", "version_no", name="task_version"),
+        UniqueConstraint(
+            "task_id",
+            "version_no",
+            name="uq_normalized_rules_task_version",
+        ),
         CheckConstraint("version_no > 0", name="version_positive"),
         CheckConstraint(
             "length(content_sha256) = 64 AND content_sha256 NOT GLOB '*[^0-9a-f]*'",
@@ -174,10 +189,21 @@ class NormalizedRuleRow(Base):
 class ValidationPlanSnapshotRow(Base):
     __tablename__ = "validation_plan_snapshots"
     __table_args__ = (
-        UniqueConstraint("task_id", "version_no", name="task_version"),
-        UniqueConstraint("task_id", "plan_id", name="task_plan"),
         UniqueConstraint(
-            "task_id", "plan_id", "openapi_snapshot_id", name="task_plan_snapshot"
+            "task_id",
+            "version_no",
+            name="uq_validation_plan_snapshots_task_version",
+        ),
+        UniqueConstraint(
+            "task_id",
+            "plan_id",
+            name="uq_validation_plan_snapshots_task_plan",
+        ),
+        UniqueConstraint(
+            "task_id",
+            "plan_id",
+            "openapi_snapshot_id",
+            name="uq_validation_plan_snapshots_task_plan_snapshot",
         ),
         CheckConstraint("version_no > 0", name="version_positive"),
         CheckConstraint(
@@ -219,9 +245,15 @@ class ValidationPlanSnapshotRow(Base):
 class ValidationAttemptRow(Base):
     __tablename__ = "validation_attempts"
     __table_args__ = (
-        UniqueConstraint("task_id", "attempt_no", name="task_attempt_no"),
         UniqueConstraint(
-            "task_id", "execution_intent_id", name="task_execution_intent"
+            "task_id",
+            "attempt_no",
+            name="uq_validation_attempts_task_attempt_no",
+        ),
+        UniqueConstraint(
+            "task_id",
+            "execution_intent_id",
+            name="uq_validation_attempts_task_execution_intent",
         ),
         ForeignKeyConstraint(
             ["task_id", "plan_id", "openapi_snapshot_id"],
@@ -230,7 +262,7 @@ class ValidationAttemptRow(Base):
                 "validation_plan_snapshots.plan_id",
                 "validation_plan_snapshots.openapi_snapshot_id",
             ],
-            name="plan_snapshot",
+            name="fk_validation_attempts_plan_snapshot",
         ),
         CheckConstraint("attempt_no > 0", name="attempt_no_positive"),
         CheckConstraint("actual_send_count BETWEEN 0 AND 3", name="actual_send_count"),
@@ -244,7 +276,7 @@ class ValidationAttemptRow(Base):
             "uq_validation_attempt_one_executing_per_task",
             "task_id",
             unique=True,
-            sqlite_where=("status = 'EXECUTING'"),
+            sqlite_where=text("status = 'EXECUTING'"),
         ),
     )
 
@@ -285,8 +317,16 @@ class ValidationAttemptRow(Base):
 class StepExecutionRecordRow(Base):
     __tablename__ = "step_execution_records"
     __table_args__ = (
-        UniqueConstraint("attempt_id", "step_index", name="attempt_step_index"),
-        UniqueConstraint("attempt_id", "plan_step_id", name="attempt_plan_step"),
+        UniqueConstraint(
+            "attempt_id",
+            "step_index",
+            name="uq_step_execution_records_attempt_step_index",
+        ),
+        UniqueConstraint(
+            "attempt_id",
+            "plan_step_id",
+            name="uq_step_execution_records_attempt_plan_step",
+        ),
         CheckConstraint("step_index > 0", name="step_index_positive"),
         CheckConstraint("send_count >= 0", name="send_count_nonnegative"),
         CheckConstraint(
@@ -305,7 +345,11 @@ class StepExecutionRecordRow(Base):
     step_index: Mapped[int] = mapped_column(nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     resolved_input_json: Mapped[str | None] = mapped_column(Text)
-    send_count: Mapped[int] = mapped_column(default=0, nullable=False)
+    send_count: Mapped[int] = mapped_column(
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
     extracted_variables_json: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[str | None] = mapped_column(UTC_TEXT_TYPE)
     completed_at: Mapped[str | None] = mapped_column(UTC_TEXT_TYPE)
@@ -316,8 +360,16 @@ class StepExecutionRecordRow(Base):
 class HttpSendRecordRow(Base):
     __tablename__ = "http_send_records"
     __table_args__ = (
-        UniqueConstraint("step_record_id", "send_no_in_step", name="step_send_no"),
-        UniqueConstraint("attempt_id", "global_send_no", name="attempt_global_send_no"),
+        UniqueConstraint(
+            "step_record_id",
+            "send_no_in_step",
+            name="uq_http_send_records_step_send_no",
+        ),
+        UniqueConstraint(
+            "attempt_id",
+            "global_send_no",
+            name="uq_http_send_records_attempt_global_send_no",
+        ),
         CheckConstraint("global_send_no > 0", name="global_send_no_positive"),
         CheckConstraint("send_no_in_step > 0", name="send_no_in_step_positive"),
         CheckConstraint(
@@ -361,7 +413,11 @@ class HttpSendRecordRow(Base):
     )
     global_send_no: Mapped[int] = mapped_column(nullable=False)
     send_no_in_step: Mapped[int] = mapped_column(nullable=False)
-    is_retry: Mapped[int] = mapped_column(default=0, nullable=False)
+    is_retry: Mapped[int] = mapped_column(
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
     retry_reason: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     method: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -379,7 +435,11 @@ class HttpSendRecordRow(Base):
     response_declared_size_bytes: Mapped[int | None] = mapped_column()
     response_captured_size_bytes: Mapped[int | None] = mapped_column()
     response_body_sha256: Mapped[str | None] = mapped_column(String(64))
-    response_truncated: Mapped[int] = mapped_column(default=0, nullable=False)
+    response_truncated: Mapped[int] = mapped_column(
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
     error_json: Mapped[str | None] = mapped_column(Text)
 
 
@@ -481,7 +541,11 @@ class EvidenceBundleRow(Base):
 class DerivedReportRow(Base):
     __tablename__ = "derived_reports"
     __table_args__ = (
-        UniqueConstraint("evidence_bundle_id", "report_version", name="bundle_version"),
+        UniqueConstraint(
+            "evidence_bundle_id",
+            "report_version",
+            name="uq_derived_reports_bundle_version",
+        ),
         CheckConstraint("report_version > 0", name="report_version_positive"),
         CheckConstraint(
             "length(content_sha256) = 64 AND content_sha256 NOT GLOB '*[^0-9a-f]*'",

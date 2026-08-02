@@ -8,13 +8,18 @@ version = "0.1.0"
 description = "A bounded API verification tool for FastAPI/OpenAPI services."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "fastapi>=0.115,<1",
+    "pydantic-settings>=2.6,<3",
+    "uvicorn>=0.32,<1",
+]
 
 [dependency-groups]
 dev = [
     "pyright>=1.1.390,<2",
     "pytest>=8.3,<9",
     "ruff>=0.8,<1",
+    "httpx>=0.28,<1",
 ]
 
 [tool.hatch.build.targets.wheel]

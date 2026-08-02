@@ -39,7 +39,8 @@ capability.
 Non-secret settings use the `APIGUARD_` environment-variable prefix. For example:
 
 ```bash
-APIGUARD_TARGET_HTTP_REQUEST_TIMEOUT_SECONDS=30 uv run uvicorn apiguard.main:app
+$env:APIGUARD_TARGET_HTTP_REQUEST_TIMEOUT_SECONDS = "30"
+uv run uvicorn apiguard.main:app
 ```
 
 ## Package layout

@@ -91,7 +91,7 @@ def test_reconstituted_awaiting_confirmation_task_can_confirm_plan() -> None:
     assert task.current_confirmed_plan_id == PLAN_ID
 
 
-def test_reconstituted_cancelled_task_remains_terminal() -> None:
+def test_reconstituted_cancelled_task_rejects_all_lifecycle_behaviors() -> None:
     task = reconstitute_task(
         status=VerificationTaskStatus.CANCELLED,
         cancelled_at=CANCELLED_AT,
@@ -101,6 +101,23 @@ def test_reconstituted_cancelled_task_remains_terminal() -> None:
 
     with pytest.raises(IllegalStateTransitionError):
         task.start_preparation(CANCELLED_AT + timedelta(minutes=1))
+    with pytest.raises(IllegalStateTransitionError):
+        task.return_to_draft(CANCELLED_AT + timedelta(minutes=1))
+    with pytest.raises(IllegalStateTransitionError):
+        task.complete_preparation(CANCELLED_AT + timedelta(minutes=1))
+    with pytest.raises(IllegalStateTransitionError):
+        task.request_plan_changes(CANCELLED_AT + timedelta(minutes=1))
+    with pytest.raises(IllegalStateTransitionError):
+        task.confirm_plan(PLAN_ID, CANCELLED_AT + timedelta(minutes=1))
+    with pytest.raises(IllegalStateTransitionError):
+        task.restart_preparation(CANCELLED_AT + timedelta(minutes=1))
+    with pytest.raises(IllegalStateTransitionError):
+        task.cancel("Cancel again.", CANCELLED_AT + timedelta(minutes=1))
+
+    assert task.status is VerificationTaskStatus.CANCELLED
+    assert task.current_confirmed_plan_id is None
+    assert task.cancelled_at == CANCELLED_AT
+    assert task.cancellation_reason == "User cancelled."
 
 
 @pytest.mark.parametrize(

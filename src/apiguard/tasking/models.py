@@ -331,16 +331,16 @@ class ValidationAttempt:
     def _reconstitute(
         cls,
         *,
-        attempt_id: ValidationAttemptId,
-        task_id: VerificationTaskId,
-        attempt_no: int,
-        plan_id: ValidationPlanId,
-        openapi_snapshot_id: OpenAPIContextSnapshotId,
-        execution_intent_id: ExecutionIntentId,
-        is_rerun: bool,
+        attempt_id: ValidationAttemptId | None,
+        task_id: VerificationTaskId | None,
+        attempt_no: int | None,
+        plan_id: ValidationPlanId | None,
+        openapi_snapshot_id: OpenAPIContextSnapshotId | None,
+        execution_intent_id: ExecutionIntentId | None,
+        is_rerun: bool | None,
         previous_attempt_id: ValidationAttemptId | None,
-        created_at: datetime,
-        started_at: datetime,
+        created_at: datetime | None,
+        started_at: datetime | None,
         status: ValidationAttemptStatus,
         actual_send_count: int,
         completed_at: datetime | None,
@@ -350,6 +350,20 @@ class ValidationAttempt:
     ) -> Self:
         """Restore a fully validated persisted attempt without replaying behaviors."""
 
+        if (
+            attempt_id is None
+            or task_id is None
+            or attempt_no is None
+            or plan_id is None
+            or openapi_snapshot_id is None
+            or execution_intent_id is None
+            or is_rerun is None
+            or created_at is None
+            or started_at is None
+        ):
+            raise DomainError(
+                "ValidationAttempt recovery requires every fixed binding value."
+            )
         if attempt_no <= 0:
             raise DomainError("attempt_no must be a positive integer.")
         if is_rerun and previous_attempt_id is None:

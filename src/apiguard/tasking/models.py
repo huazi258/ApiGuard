@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import ClassVar
+from typing import ClassVar, Self
 
 from apiguard.shared.enums import (
     ValidationAttemptStatus,
@@ -20,6 +20,13 @@ from apiguard.shared.ids import (
     ValidationPlanId,
     VerificationTaskId,
 )
+
+
+def _require_timezone_aware(value: datetime, field_name: str) -> None:
+    """Reject persisted timestamps that do not carry an explicit offset."""
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise DomainError(f"{field_name} must be timezone-aware.")
 
 
 @dataclass(slots=True)
@@ -46,6 +53,73 @@ class VerificationTask:
 
     def __post_init__(self) -> None:
         self._updated_at = self.created_at
+
+    @classmethod
+    def _reconstitute(
+        cls,
+        *,
+        task_id: VerificationTaskId,
+        task_type: VerificationTaskType,
+        verification_objective: str,
+        created_at: datetime,
+        status: VerificationTaskStatus,
+        current_confirmed_plan_id: ValidationPlanId | None,
+        updated_at: datetime,
+        cancelled_at: datetime | None,
+        cancellation_reason: str | None,
+    ) -> Self:
+        """Restore a fully validated persisted task without replaying behaviors."""
+
+        _require_timezone_aware(created_at, "created_at")
+        _require_timezone_aware(updated_at, "updated_at")
+        if updated_at < created_at:
+            raise DomainError("updated_at cannot be earlier than created_at.")
+        if cancelled_at is not None:
+            _require_timezone_aware(cancelled_at, "cancelled_at")
+            if cancelled_at < created_at:
+                raise DomainError("cancelled_at cannot be earlier than created_at.")
+
+        if status is VerificationTaskStatus.CANCELLED:
+            if cancelled_at is None or cancellation_reason is None:
+                raise DomainError(
+                    "CANCELLED tasks require cancellation timestamp and reason."
+                )
+            if updated_at != cancelled_at:
+                raise DomainError(
+                    "CANCELLED tasks require updated_at to equal cancelled_at."
+                )
+        else:
+            if cancelled_at is not None or cancellation_reason is not None:
+                raise DomainError("Active tasks cannot contain cancellation facts.")
+            if status is VerificationTaskStatus.READY:
+                if current_confirmed_plan_id is None:
+                    raise DomainError(
+                        "READY tasks require a current confirmed ValidationPlanId."
+                    )
+            elif status in (
+                VerificationTaskStatus.DRAFT,
+                VerificationTaskStatus.PREPARING,
+                VerificationTaskStatus.AWAITING_CONFIRMATION,
+            ):
+                if current_confirmed_plan_id is not None:
+                    raise DomainError(
+                        "Only READY or CANCELLED tasks may retain a confirmed plan."
+                    )
+            else:
+                raise DomainError("VerificationTask status is not supported.")
+
+        task = cls(
+            task_id=task_id,
+            task_type=task_type,
+            verification_objective=verification_objective,
+            created_at=created_at,
+        )
+        task._status = status
+        task._current_confirmed_plan_id = current_confirmed_plan_id
+        task._updated_at = updated_at
+        task._cancelled_at = cancelled_at
+        task._cancellation_reason = cancellation_reason
+        return task
 
     @property
     def status(self) -> VerificationTaskStatus:
@@ -252,6 +326,83 @@ class ValidationAttempt:
         self._evaluation_result_id = None
         self._evidence_bundle_id = None
         self._conclusion = None
+
+    @classmethod
+    def _reconstitute(
+        cls,
+        *,
+        attempt_id: ValidationAttemptId,
+        task_id: VerificationTaskId,
+        attempt_no: int,
+        plan_id: ValidationPlanId,
+        openapi_snapshot_id: OpenAPIContextSnapshotId,
+        execution_intent_id: ExecutionIntentId,
+        is_rerun: bool,
+        previous_attempt_id: ValidationAttemptId | None,
+        created_at: datetime,
+        started_at: datetime,
+        status: ValidationAttemptStatus,
+        actual_send_count: int,
+        completed_at: datetime | None,
+        evaluation_result_id: EvaluationResultId | None,
+        evidence_bundle_id: EvidenceBundleId | None,
+        conclusion: ValidationConclusion | None,
+    ) -> Self:
+        """Restore a fully validated persisted attempt without replaying behaviors."""
+
+        if attempt_no <= 0:
+            raise DomainError("attempt_no must be a positive integer.")
+        if is_rerun and previous_attempt_id is None:
+            raise DomainError("Reruns require a previous_attempt_id.")
+        if not is_rerun and previous_attempt_id is not None:
+            raise DomainError("Initial attempts cannot have a previous_attempt_id.")
+        _require_timezone_aware(created_at, "created_at")
+        _require_timezone_aware(started_at, "started_at")
+        if started_at < created_at:
+            raise DomainError("started_at cannot be earlier than created_at.")
+        if completed_at is not None:
+            _require_timezone_aware(completed_at, "completed_at")
+            if completed_at < started_at:
+                raise DomainError("completed_at cannot be earlier than started_at.")
+        if not 0 <= actual_send_count <= cls.MAX_HTTP_SENDS_PER_ATTEMPT:
+            raise DomainError(
+                "actual_send_count must be between zero and the HTTP send limit."
+            )
+
+        final_values = (
+            completed_at,
+            evaluation_result_id,
+            evidence_bundle_id,
+            conclusion,
+        )
+        if status is ValidationAttemptStatus.EXECUTING:
+            if any(value is not None for value in final_values):
+                raise DomainError("EXECUTING attempts cannot contain final values.")
+        elif status is ValidationAttemptStatus.COMPLETED:
+            if any(value is None for value in final_values):
+                raise DomainError("COMPLETED attempts require all final values.")
+        else:
+            raise DomainError("ValidationAttempt status is not supported.")
+
+        attempt = cls(
+            attempt_id=attempt_id,
+            task_id=task_id,
+            attempt_no=attempt_no,
+            plan_id=plan_id,
+            openapi_snapshot_id=openapi_snapshot_id,
+            execution_intent_id=execution_intent_id,
+            is_rerun=is_rerun,
+            previous_attempt_id=previous_attempt_id,
+            created_at=created_at,
+            started_at=started_at,
+        )
+        attempt._status = status
+        attempt._actual_send_count = actual_send_count
+        attempt._completed_at = completed_at
+        attempt._evaluation_result_id = evaluation_result_id
+        attempt._evidence_bundle_id = evidence_bundle_id
+        attempt._conclusion = conclusion
+        return attempt
 
     @property
     def attempt_id(self) -> ValidationAttemptId:

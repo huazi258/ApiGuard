@@ -23,11 +23,18 @@ class LocalFileOpenAPISource:
             if max_bytes is not None
             else Settings().max_openapi_document_bytes
         )
+        if self._max_bytes <= 0:
+            raise ValueError("max_bytes must be greater than zero.")
 
     def read(self, descriptor: OpenAPISourceDescriptor) -> OpenAPISourceReadResult:
-        if descriptor.kind is not OpenAPISourceKind.LOCAL_FILE:
-            raise ValueError("LocalFileOpenAPISource requires LOCAL_FILE.")
         started = monotonic()
+        if descriptor.kind is not OpenAPISourceKind.LOCAL_FILE:
+            raise self._error(
+                OpenAPISourceErrorCode.UNSUPPORTED_OPENAPI_SOURCE,
+                descriptor,
+                started,
+                0,
+            )
         received = 0
         try:
             path = Path(descriptor.location)
@@ -116,4 +123,10 @@ class LocalFileOpenAPISource:
             bytes_received=received,
             error_code=code,
         )
-        return OpenAPISourceError(code, descriptor, (attempt,))
+        return OpenAPISourceError(
+            code,
+            descriptor,
+            (attempt,),
+            retryable=False,
+            safe_detail="Local OpenAPI source could not be read.",
+        )

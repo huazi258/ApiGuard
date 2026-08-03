@@ -1,5 +1,6 @@
 """Synchronous SQLAlchemy Unit of Work implementation."""
 
+from contextlib import suppress
 from types import TracebackType
 
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
@@ -41,23 +42,39 @@ class SqlAlchemyUnitOfWork:
         try:
             self._session.commit()
         except IntegrityError as error:
-            self._session.rollback()
+            self._rollback_after_failed_commit()
             raise PersistenceConflict(
                 "The database rejected a persistence constraint."
             ) from error
         except OperationalError as error:
-            self._session.rollback()
+            self._rollback_after_failed_commit()
             raise PersistenceUnavailable("The database is unavailable.") from error
         except SQLAlchemyError as error:
-            self._session.rollback()
+            self._rollback_after_failed_commit()
             raise PersistenceUnavailable(
                 "The database operation could not be completed."
             ) from error
 
     def rollback(self) -> None:
-        self._session.rollback()
+        try:
+            self._session.rollback()
+        except SQLAlchemyError as error:
+            raise PersistenceUnavailable(
+                "The database rollback could not be completed."
+            ) from error
 
     def close(self) -> None:
         if not self._closed:
-            self._session.close()
+            try:
+                self._session.close()
+            except SQLAlchemyError as error:
+                raise PersistenceUnavailable(
+                    "The database session could not be closed."
+                ) from error
             self._closed = True
+
+    def _rollback_after_failed_commit(self) -> None:
+        """Attempt cleanup without replacing the classified commit failure."""
+
+        with suppress(SQLAlchemyError):
+            self._session.rollback()

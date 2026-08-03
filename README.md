@@ -6,12 +6,15 @@ local and test environments, not production.
 
 ## Current milestone
 
-Milestone 1 is complete. Milestone 2 has established the SQLite schema and its
-initial migration foundation; mapper, Repository, Unit of Work, and business
-persistence are still not implemented.
+Milestone 1 and the Milestone 2 persistence implementation are complete.
+Formal M2 sealing still requires the canonical `uv` gate in an environment where
+the `uv` executable is available. Milestone 3 has not started.
 
 - M2-01: domain entity reconstitution is complete.
 - M2-02: SQLite schema and the initial Alembic migration are complete.
+- M2-03: Task and Attempt ORM mappers are complete.
+- M2-04: application persistence ports, repositories, and Unit of Work are complete.
+- M2-05: full file-SQLite persistence acceptance is complete.
 
 | Task | Result | Commit |
 | --- | --- | --- |
@@ -40,6 +43,11 @@ The PowerShell documentation-only correction is `ab88a5c92f15683ef787a1d17a500f8
   initial migration.
 - File-backed SQLite connections use foreign keys, WAL, synchronous NORMAL, and
   a five-second busy timeout.
+- Task and Attempt state persist and recover across Unit of Work and Engine
+  recreation; executing attempts can be queried by execution intent or as a
+  stable ordered list.
+- EvidenceBundle and DerivedReport records are append-only. Attempt completion
+  and EvidenceBundle insertion can commit atomically.
 
 Apply the schema explicitly; application startup never migrates a database:
 
@@ -51,14 +59,12 @@ uv run alembic upgrade head
 
 ### Not implemented
 
-- Row/domain mappers, Repository, Unit of Work, and business persistence.
-- OpenAPI parsing, plan models, and plan validation.
+- OpenAPI reading/parsing, plan data contracts, and plan validation.
 - HTTP execution and deterministic evaluation.
-- Model calls, product API, and Jinja2 pages.
-- EvidenceBundle contents, derived reports, and startup recovery.
+- Model calls, product API, report generation, and Jinja2 pages.
+- Startup recovery (including handling legacy EXECUTING attempts).
 
-Milestone 2 persistence work is in progress; its next task is not started by
-this schema-only change.
+See [Milestone 2 persistence acceptance](docs/milestones/milestone-02-persistence-acceptance.md).
 
 ## Requirements
 

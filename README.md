@@ -6,9 +6,7 @@ local and test environments, not production.
 
 ## Current milestone
 
-Milestone 1 and the Milestone 2 persistence implementation are complete.
-Formal M2 sealing still requires the canonical `uv` gate in an environment where
-the `uv` executable is available. Milestone 3 has not started.
+Milestone 2 is complete and formally sealed. Milestone 3 has not started.
 
 - M2-01: domain entity reconstitution is complete.
 - M2-02: SQLite schema and the initial Alembic migration are complete.

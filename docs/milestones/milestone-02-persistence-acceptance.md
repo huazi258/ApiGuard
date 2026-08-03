@@ -35,7 +35,14 @@ uv run ruff format --check .
 uv run pyright
 ```
 
+## Formal seal
+
+The canonical `uv` gate completed on 2026-08-03 with uv 0.12.1 on Windows
+x86_64. The file-backed Alembic migration succeeded from a nonexistent
+temporary SQLite path. Persistence integration tests: 28 passed; full suite:
+196 passed. Ruff and format checks passed; Pyright reported 0 errors and 0
+warnings.
+
 The known non-blocking warning is Starlette's third-party TestClient warning
 about its HTTPX usage. Milestone 3 begins with OpenAPI context and plan data
-contracts. The canonical `uv` gate remains pending when the host environment
-does not provide a `uv` executable; locked `.venv` verification is supplementary.
+contracts.

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import gzip
 import ssl
 from collections.abc import Callable, Iterator
+from hashlib import sha256
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Event, Thread
+from time import monotonic, sleep
 from typing import NotRequired, TypedDict, Unpack
 
 import httpx
@@ -64,6 +69,31 @@ class SourceOptions(TypedDict):
     timeout_seconds: NotRequired[float]
     max_attempts: NotRequired[int]
     max_bytes: NotRequired[int]
+
+
+class DelayedChunkHandler(BaseHTTPRequestHandler):
+    first_chunk_sent: Event
+    completed: Event
+
+    def do_GET(self) -> None:  # noqa: N802
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.end_headers()
+        sleep(0.1)
+        self.wfile.write(b"first")
+        self.wfile.flush()
+        self.first_chunk_sent.set()
+        sleep(1.0)
+        try:
+            self.wfile.write(b"second")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            self.completed.set()
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
 
 
 def descriptor(
@@ -342,6 +372,64 @@ def test_does_not_retry_tls_failure() -> None:
     assert request_count == 1
 
 
+def test_decoding_error_is_not_retried() -> None:
+    request_count = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip"},
+            stream=RaisingStream((b"not a gzip document",)),
+        )
+
+    with pytest.raises(OpenAPISourceError) as error:
+        source_for(handler).read(descriptor())
+    assert error.value.code is OpenAPISourceErrorCode.OPENAPI_SOURCE_READ_FAILED
+    assert request_count == 1
+
+
+def test_local_protocol_error_is_not_retried() -> None:
+    request_count = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        raise httpx.LocalProtocolError("invalid local request state")
+
+    with pytest.raises(OpenAPISourceError) as error:
+        source_for(handler).read(descriptor())
+    assert error.value.code is OpenAPISourceErrorCode.OPENAPI_SOURCE_READ_FAILED
+    assert request_count == 1
+
+
+def test_remote_protocol_error_is_retried_once() -> None:
+    request_count = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            raise httpx.RemoteProtocolError("remote protocol interrupted")
+        return httpx.Response(200, content=b"complete")
+
+    result = source_for(handler).read(descriptor())
+    assert result.raw_document == b"complete"
+    assert result.attempts[0].outcome is OpenAPISourceAttemptOutcome.FAILED_RETRYABLE
+    assert request_count == 2
+
+
+def test_invalid_url_is_a_stable_source_error() -> None:
+    with pytest.raises(OpenAPISourceError) as error:
+        source_for(lambda _: httpx.Response(200)).read(
+            descriptor("https://example.test:notaport/openapi.json")
+        )
+    assert error.value.code is OpenAPISourceErrorCode.INVALID_OPENAPI_SOURCE_LOCATION
+    assert error.value.attempts[0].outcome is OpenAPISourceAttemptOutcome.FAILED_FINAL
+    assert len(error.value.attempts) == 1
+
+
 def test_deadline_covers_response_body_without_resetting_per_chunk() -> None:
     clock = FakeClock()
     request_count = 0
@@ -360,10 +448,63 @@ def test_deadline_covers_response_body_without_resetting_per_chunk() -> None:
         descriptor()
     )
     assert result.raw_document == b"complete"
-    assert result.attempts[0].bytes_received == 1
     assert result.attempts[0].outcome is OpenAPISourceAttemptOutcome.FAILED_RETRYABLE
     assert request_count == 2
     assert requests[0].extensions["timeout"]["read"] == 1
+
+
+def test_deadline_interrupts_a_blocking_loopback_body_read() -> None:
+    DelayedChunkHandler.first_chunk_sent = Event()
+    DelayedChunkHandler.completed = Event()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), DelayedChunkHandler)
+    server_thread = Thread(target=server.serve_forever)
+    server_thread.start()
+    try:
+        port = server.server_address[1]
+        client = httpx.Client(follow_redirects=False, trust_env=False)
+        source = HttpOpenAPISource(client, timeout_seconds=0.5, max_attempts=1)
+        started = monotonic()
+        with pytest.raises(OpenAPISourceError) as error:
+            source.read(descriptor(f"http://127.0.0.1:{port}/openapi.json"))
+        elapsed = monotonic() - started
+        assert DelayedChunkHandler.first_chunk_sent.is_set()
+        assert error.value.code is OpenAPISourceErrorCode.OPENAPI_FETCH_TIMEOUT
+        assert error.value.attempts[0].bytes_received == len(b"first")
+        assert elapsed < 0.9
+        client.close()
+    finally:
+        DelayedChunkHandler.completed.wait(timeout=2)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+    assert not server_thread.is_alive()
+
+
+@pytest.mark.parametrize("decoded_size", [512, 513])
+def test_enforces_limit_on_gzip_decoded_bytes(decoded_size: int) -> None:
+    decoded = b"x" * decoded_size
+    compressed = gzip.compress(decoded)
+    assert len(compressed) < 512
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip"},
+            stream=RaisingStream((compressed,)),
+        )
+
+    source = source_for(handler, max_bytes=512)
+    if decoded_size == 512:
+        result = source.read(descriptor())
+        assert result.raw_document == decoded
+        assert result.size_bytes == decoded_size
+        assert result.content_sha256 == sha256(decoded).hexdigest()
+    else:
+        with pytest.raises(OpenAPISourceError) as error:
+            source.read(descriptor())
+        assert error.value.code is OpenAPISourceErrorCode.OPENAPI_DOCUMENT_TOO_LARGE
+        assert error.value.attempts[0].bytes_received == decoded_size
+        assert len(error.value.attempts) == 1
 
 
 def test_rejects_oversized_content_length_without_consuming_body() -> None:

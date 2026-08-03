@@ -1,7 +1,9 @@
 """Bounded synchronous HTTP OpenAPI source adapter."""
 
 import ssl
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import suppress
 from hashlib import sha256
 from time import monotonic
@@ -207,9 +209,8 @@ class HttpOpenAPISource:
             body = iter(response.iter_bytes())
             while True:
                 self._set_timeout(request, self._remaining(deadline, received))
-                try:
-                    chunk = next(body)
-                except StopIteration:
+                chunk = self._read_next_chunk(body, response, deadline, received)
+                if chunk is None:
                     break
                 received += len(chunk)
                 self._remaining(deadline, received)
@@ -231,6 +232,13 @@ class HttpOpenAPISource:
             return raw_document, response.headers.get("content-type")
         except _RemoteReadFailure:
             raise
+        except httpx.InvalidURL as error:
+            raise _RemoteReadFailure(
+                OpenAPISourceErrorCode.INVALID_OPENAPI_SOURCE_LOCATION,
+                retryable=False,
+                bytes_received=received,
+                cause=error,
+            ) from error
         except httpx.TimeoutException as error:
             raise _RemoteReadFailure(
                 OpenAPISourceErrorCode.OPENAPI_FETCH_TIMEOUT,
@@ -238,10 +246,43 @@ class HttpOpenAPISource:
                 bytes_received=received,
                 cause=error,
             ) from error
-        except httpx.HTTPError as error:
+        except (
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.RemoteProtocolError,
+        ) as error:
             raise _RemoteReadFailure(
                 OpenAPISourceErrorCode.OPENAPI_SOURCE_UNAVAILABLE,
                 retryable=not _has_ssl_error(error),
+                bytes_received=received,
+                cause=error,
+            ) from error
+        except (httpx.DecodingError, httpx.LocalProtocolError) as error:
+            raise _RemoteReadFailure(
+                OpenAPISourceErrorCode.OPENAPI_SOURCE_READ_FAILED,
+                retryable=False,
+                bytes_received=received,
+                cause=error,
+            ) from error
+        except httpx.ProxyError as error:
+            raise _RemoteReadFailure(
+                OpenAPISourceErrorCode.OPENAPI_SOURCE_UNAVAILABLE,
+                retryable=False,
+                bytes_received=received,
+                cause=error,
+            ) from error
+        except httpx.UnsupportedProtocol as error:
+            raise _RemoteReadFailure(
+                OpenAPISourceErrorCode.INVALID_OPENAPI_SOURCE_LOCATION,
+                retryable=False,
+                bytes_received=received,
+                cause=error,
+            ) from error
+        except httpx.HTTPError as error:
+            raise _RemoteReadFailure(
+                OpenAPISourceErrorCode.OPENAPI_SOURCE_UNAVAILABLE,
+                retryable=False,
                 bytes_received=received,
                 cause=error,
             ) from error
@@ -262,6 +303,34 @@ class HttpOpenAPISource:
 
     def _elapsed_ms(self, started: float) -> int:
         return max(0, int((self._clock() - started) * 1000))
+
+    def _read_next_chunk(
+        self,
+        body: Iterator[bytes],
+        response: httpx.Response,
+        deadline: float,
+        bytes_received: int,
+    ) -> bytes | None:
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(next, body)
+        try:
+            try:
+                return future.result(timeout=self._remaining(deadline, bytes_received))
+            except StopIteration:
+                return None
+            except FutureTimeoutError as error:
+                with suppress(httpx.HTTPError):
+                    response.close()
+                with suppress(StopIteration, httpx.HTTPError):
+                    future.result()
+                raise _RemoteReadFailure(
+                    OpenAPISourceErrorCode.OPENAPI_FETCH_TIMEOUT,
+                    retryable=True,
+                    bytes_received=bytes_received,
+                    cause=error,
+                ) from error
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
 
     def _set_timeout(self, request: httpx.Request, remaining: float) -> None:
         request.extensions["timeout"] = httpx.Timeout(remaining).as_dict()

@@ -1,0 +1,1 @@
+"""OpenAPI source infrastructure adapters."""

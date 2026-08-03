@@ -74,6 +74,10 @@ def test_descriptor_validates_without_filesystem_access(
         (OpenAPISourceKind.LOCAL_FILE, "https://example.test/spec"),
         (OpenAPISourceKind.LOCAL_FILE, "file:///spec.yaml"),
         (OpenAPISourceKind.LOCAL_FILE, "ftp://example.test/spec"),
+        (OpenAPISourceKind.LOCAL_FILE, "s3://bucket/spec"),
+        (OpenAPISourceKind.LOCAL_FILE, "custom://service/spec"),
+        (OpenAPISourceKind.LOCAL_FILE, "gopher://example.test/spec"),
+        (OpenAPISourceKind.LOCAL_FILE, "data:text/plain,test"),
         (OpenAPISourceKind.REMOTE_HTTP, "spec.yaml"),
         (OpenAPISourceKind.REMOTE_HTTP, "C:\\spec.yaml"),
         (OpenAPISourceKind.REMOTE_HTTP, ""),
@@ -90,6 +94,24 @@ def test_descriptor_rejects_invalid_kind_and_location_pairs(
 ) -> None:
     with pytest.raises(ValidationError):
         OpenAPISourceDescriptor(kind=kind, location=location)
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "relative/openapi.yaml",
+        "./openapi.yaml",
+        "../openapi.yaml",
+        "/absolute/path/openapi.yaml",
+        r"C:\specs\openapi.yaml",
+        r"\\server\share\openapi.yaml",
+    ],
+)
+def test_descriptor_accepts_local_filesystem_paths(location: str) -> None:
+    descriptor = OpenAPISourceDescriptor(
+        kind=OpenAPISourceKind.LOCAL_FILE, location=location
+    )
+    assert descriptor.location == location
 
 
 def test_successful_attempt_cannot_have_an_error_code() -> None:

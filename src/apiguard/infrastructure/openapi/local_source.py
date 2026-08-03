@@ -13,6 +13,7 @@ from apiguard.openapi_context.source import (
     OpenAPISourceKind,
     OpenAPISourceReadAttempt,
     OpenAPISourceReadResult,
+    safe_source_display_value,
 )
 
 
@@ -102,7 +103,7 @@ class LocalFileOpenAPISource:
         )
         return OpenAPISourceReadResult(
             source_kind=descriptor.kind,
-            source_display_value=descriptor.location,
+            source_display_value=safe_source_display_value(descriptor),
             raw_document=raw,
             size_bytes=len(raw),
             content_sha256=sha256(raw).hexdigest(),

@@ -29,6 +29,7 @@ def descriptor(path: Path) -> OpenAPISourceDescriptor:
     [
         ("openapi.json", b'{"openapi":"3.1.0"}'),
         ("openapi.yaml", b"openapi: 3.1.0\n"),
+        ("spec.any", b"unparsed OpenAPI bytes"),
     ],
 )
 def test_reads_json_and_yaml_files(tmp_path: Path, name: str, raw: bytes) -> None:
@@ -156,6 +157,21 @@ def test_rejects_non_local_descriptor_with_stable_source_error() -> None:
         LocalFileOpenAPISource().read(descriptor)
     assert error.value.code is OpenAPISourceErrorCode.UNSUPPORTED_OPENAPI_SOURCE
     assert error.value.retryable is False
+
+
+def test_masks_remote_query_values_in_unsupported_source_error() -> None:
+    descriptor = OpenAPISourceDescriptor(
+        kind=OpenAPISourceKind.REMOTE_HTTP,
+        location="https://example.test/openapi.json?token=secret&tenant=demo",
+    )
+    with pytest.raises(OpenAPISourceError) as error:
+        LocalFileOpenAPISource().read(descriptor)
+    assert error.value.code is OpenAPISourceErrorCode.UNSUPPORTED_OPENAPI_SOURCE
+    assert error.value.source_display_value == (
+        "https://example.test/openapi.json?token=***&tenant=***"
+    )
+    assert "secret" not in error.value.source_display_value
+    assert "demo" not in error.value.source_display_value
 
 
 @pytest.mark.parametrize("max_bytes", [0, -1])

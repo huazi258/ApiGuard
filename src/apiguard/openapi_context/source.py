@@ -3,7 +3,7 @@
 from enum import StrEnum
 from hashlib import sha256
 from typing import Protocol
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -44,15 +44,12 @@ class OpenAPISourceDescriptor(BaseModel):
         if not self.location.strip() or "\x00" in self.location:
             raise ValueError("OpenAPI source location must be non-empty and NUL-free.")
         parsed = urlsplit(self.location)
-        if self.kind is OpenAPISourceKind.LOCAL_FILE and parsed.scheme.lower() in {
-            "http",
-            "https",
-            "file",
-            "ftp",
-        }:
+        if self.kind is OpenAPISourceKind.LOCAL_FILE and _is_uri_location(
+            self.location, parsed.scheme
+        ):
             raise ValueError("Local OpenAPI sources require a filesystem path.")
         if self.kind is OpenAPISourceKind.REMOTE_HTTP:
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
                 raise ValueError("Remote OpenAPI sources require an HTTP(S) URL.")
             if (
                 parsed.username is not None
@@ -63,6 +60,28 @@ class OpenAPISourceDescriptor(BaseModel):
                     "Remote OpenAPI URLs cannot contain credentials or fragments."
                 )
         return self
+
+
+def _is_uri_location(location: str, scheme: str) -> bool:
+    return bool(scheme) and not (
+        len(location) >= 3
+        and location[0].isalpha()
+        and location[1] == ":"
+        and location[2] in {"/", "\\"}
+    )
+
+
+def safe_source_display_value(descriptor: OpenAPISourceDescriptor) -> str:
+    """Return a deterministic source value that is safe to expose to callers."""
+    if descriptor.kind is OpenAPISourceKind.LOCAL_FILE:
+        return descriptor.location
+    parsed = urlsplit(descriptor.location)
+    masked_query = "&".join(
+        f"{parameter.split('=', maxsplit=1)[0]}=***"
+        for parameter in parsed.query.split("&")
+        if parameter
+    )
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, masked_query, ""))
 
 
 class OpenAPISourceReadAttempt(BaseModel):
@@ -144,7 +163,7 @@ class OpenAPISourceError(Exception):
     ) -> None:
         self.code = code
         self.source_kind = descriptor.kind
-        self.source_display_value = descriptor.location
+        self.source_display_value = safe_source_display_value(descriptor)
         self.retryable = retryable
         self.attempts = attempts
         self.safe_detail = safe_detail

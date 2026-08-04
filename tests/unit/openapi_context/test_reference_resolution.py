@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import builtins
 import socket
+from collections.abc import Callable
 from copy import deepcopy
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -327,6 +328,219 @@ def test_success_cache_is_per_resolver_and_use_site_metadata_is_independent() ->
     assert second.metadata_override == type(second.metadata_override)(None, "second")
     assert resolver(root).resolve(
         first_ref, first_pointer, ReferenceTargetKind.RESPONSE
+    )
+
+
+def test_cached_tail_rechecks_depth_and_reuses_the_legal_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = document()
+    root["components"]["schemas"] = {
+        f"B{index}": (
+            {"type": "string"}
+            if index == MAX_REFERENCE_CHAIN_DEPTH
+            else {"$ref": f"#/components/schemas/B{index + 1}"}
+        )
+        for index in range(1, MAX_REFERENCE_CHAIN_DEPTH + 1)
+    }
+    direct_reference, direct_pointer = add_use(
+        root, "direct", "#/components/schemas/B1"
+    )
+    current = resolver(root)
+    assert (
+        len(
+            current.resolve(
+                direct_reference, direct_pointer, ReferenceTargetKind.SCHEMA
+            ).records
+        )
+        == MAX_REFERENCE_CHAIN_DEPTH
+    )
+    root["components"]["schemas"]["A"] = {"$ref": "#/components/schemas/B1"}
+    prefixed_reference, prefixed_pointer = add_use(
+        root, "prefixed", "#/components/schemas/A"
+    )
+    calls: list[JsonPointer] = []
+    original_lookup = cast(
+        Callable[
+            [
+                JsonPointer,
+                ReferenceTargetKind,
+                JsonPointer,
+                ReferenceTargetKind,
+                int,
+            ],
+            dict[str, Any],
+        ],
+        object.__getattribute__(current, "_lookup_target"),
+    )
+
+    def count_lookup(
+        canonical_target_pointer: JsonPointer,
+        target_kind: ReferenceTargetKind,
+        reference_pointer: JsonPointer,
+        expected_target_kind: ReferenceTargetKind,
+        chain_depth: int,
+    ) -> dict[str, Any]:
+        calls.append(canonical_target_pointer)
+        return original_lookup(
+            canonical_target_pointer,
+            target_kind,
+            reference_pointer,
+            expected_target_kind,
+            chain_depth,
+        )
+
+    monkeypatch.setattr(current, "_lookup_target", count_lookup)
+    with pytest.raises(ReferenceResolutionError) as raised:
+        current.resolve(
+            prefixed_reference, prefixed_pointer, ReferenceTargetKind.SCHEMA
+        )
+    assert (
+        raised.value.code
+        is ReferenceResolutionErrorCode.OPENAPI_REFERENCE_DEPTH_EXCEEDED
+    )
+    assert raised.value.reference_pointer == JsonPointer("/components/schemas/B31/$ref")
+    assert raised.value.canonical_target_pointer == JsonPointer(
+        "/components/schemas/B32"
+    )
+    assert raised.value.chain_depth == 33
+    assert calls == [
+        JsonPointer("/components/schemas/A"),
+        JsonPointer("/components/schemas/B1"),
+    ]
+
+    root = document()
+    root["components"]["schemas"] = {
+        f"B{index}": (
+            {"type": "string"}
+            if index == MAX_REFERENCE_CHAIN_DEPTH - 1
+            else {"$ref": f"#/components/schemas/B{index + 1}"}
+        )
+        for index in range(1, MAX_REFERENCE_CHAIN_DEPTH)
+    }
+    direct_reference, direct_pointer = add_use(
+        root, "direct", "#/components/schemas/B1"
+    )
+    current = resolver(root)
+    current.resolve(direct_reference, direct_pointer, ReferenceTargetKind.SCHEMA)
+    root["components"]["schemas"]["A"] = {"$ref": "#/components/schemas/B1"}
+    prefixed_reference, prefixed_pointer = add_use(
+        root, "prefixed", "#/components/schemas/A"
+    )
+    assert (
+        len(
+            current.resolve(
+                prefixed_reference, prefixed_pointer, ReferenceTargetKind.SCHEMA
+            ).records
+        )
+        == MAX_REFERENCE_CHAIN_DEPTH
+    )
+
+
+def test_internal_dynamic_references_and_null_metadata_are_stable() -> None:
+    root = document()
+    root["components"]["schemas"]["A"] = {"$dynamicRef": "#/components/schemas/Order"}
+    reference, pointer = add_use(root, "dynamic", "#/components/schemas/A")
+    error = assert_error(
+        root,
+        reference,
+        pointer,
+        ReferenceTargetKind.SCHEMA,
+        ReferenceResolutionErrorCode.OPENAPI_DYNAMIC_REFERENCE_UNSUPPORTED,
+        ReferenceResolutionFailureCategory.UNSUPPORTED_FEATURE,
+        expected_reference_pointer=JsonPointer("/components/schemas/A/$dynamicRef"),
+    )
+    assert error.canonical_target_pointer == JsonPointer("/components/schemas/A")
+    assert error.chain_depth == 2
+    root["components"]["schemas"]["A"] = {
+        "$ref": "#/components/schemas/Order",
+        "$dynamicRef": "#/components/schemas/Order",
+    }
+    assert_error(
+        root,
+        reference,
+        pointer,
+        ReferenceTargetKind.SCHEMA,
+        ReferenceResolutionErrorCode.OPENAPI_DYNAMIC_REFERENCE_UNSUPPORTED,
+        ReferenceResolutionFailureCategory.UNSUPPORTED_FEATURE,
+        expected_reference_pointer=JsonPointer("/components/schemas/A/$dynamicRef"),
+    )
+    root = document()
+    reference, pointer = add_use(
+        root, "null", "#/components/responses/Order", summary=None
+    )
+    error = assert_error(
+        root,
+        reference,
+        pointer,
+        ReferenceTargetKind.RESPONSE,
+        ReferenceResolutionErrorCode.OPENAPI_REFERENCE_METADATA_INVALID,
+        ReferenceResolutionFailureCategory.INVALID_DOCUMENT,
+    )
+    assert error.canonical_target_pointer == JsonPointer("/components/responses/Order")
+    assert error.chain_depth == 1
+    root["components"]["responses"] = {
+        "A": {"$ref": "#/components/responses/B", "description": None},
+        "B": {"description": "concrete"},
+    }
+    reference, pointer = add_use(root, "internal-null", "#/components/responses/A")
+    error = assert_error(
+        root,
+        reference,
+        pointer,
+        ReferenceTargetKind.RESPONSE,
+        ReferenceResolutionErrorCode.OPENAPI_REFERENCE_METADATA_INVALID,
+        ReferenceResolutionFailureCategory.INVALID_DOCUMENT,
+        expected_reference_pointer=JsonPointer("/components/responses/A/$ref"),
+    )
+    assert error.canonical_target_pointer == JsonPointer("/components/responses/B")
+    assert error.chain_depth == 2
+
+
+def test_internal_schema_siblings_array_indexes_and_component_path_items() -> None:
+    root = document()
+    root["components"]["schemas"] = {
+        "A": {"$ref": "#/components/schemas/B", "description": "unsupported"},
+        "B": {"type": "string"},
+    }
+    reference, pointer = add_use(root, "schema", "#/components/schemas/A")
+    error = assert_error(
+        root,
+        reference,
+        pointer,
+        ReferenceTargetKind.SCHEMA,
+        ReferenceResolutionErrorCode.OPENAPI_SCHEMA_REF_SIBLING_UNSUPPORTED,
+        ReferenceResolutionFailureCategory.UNSUPPORTED_FEATURE,
+        expected_reference_pointer=JsonPointer("/components/schemas/A/$ref"),
+    )
+    assert error.canonical_target_pointer == JsonPointer("/components/schemas/B")
+    assert error.chain_depth == 2
+    root = document()
+    root["uses"] = [{"$ref": "#/components/schemas/Order"}]
+    result = resolver(root).resolve(
+        root["uses"][0]["$ref"],
+        JsonPointer("/uses/0/$ref"),
+        ReferenceTargetKind.SCHEMA,
+    )
+    assert result.target["type"] == "object"
+    for invalid_index in ["00", "01", "０", "١", "-1", "+"]:
+        assert_error(
+            root,
+            root["uses"][0]["$ref"],
+            JsonPointer(f"/uses/{invalid_index}/$ref"),
+            ReferenceTargetKind.SCHEMA,
+            ReferenceResolutionErrorCode.OPENAPI_REFERENCE_LOCATION_INVALID,
+            ReferenceResolutionFailureCategory.INVALID_DOCUMENT,
+        )
+    root = document()
+    reference, pointer = add_use(root, "path-item", "#/components/pathItems/SharedPath")
+    assert_error(
+        root,
+        reference,
+        pointer,
+        ReferenceTargetKind.SCHEMA,
+        ReferenceResolutionErrorCode.OPENAPI_PATH_ITEM_REFERENCE_UNSUPPORTED,
+        ReferenceResolutionFailureCategory.UNSUPPORTED_FEATURE,
     )
 
 

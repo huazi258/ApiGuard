@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -19,6 +20,7 @@ from apiguard.openapi_context.models import (
 from apiguard.shared.json_pointer import JsonPointer
 
 MAX_REFERENCE_CHAIN_DEPTH = 32
+_ARRAY_INDEX_PATTERN = re.compile(r"0|[1-9][0-9]*", re.ASCII)
 
 
 class ReferenceResolutionFailureCategory(StrEnum):
@@ -161,7 +163,7 @@ class OpenAPIReferenceResolver:
                 reference_pointer,
                 expected_target_kind,
                 canonical_target_pointer=None,
-                chain_depth=0,
+                chain_depth=1,
             )
         original_reference = self._validate_reference_value(
             reference, reference_pointer, expected_target_kind, 1
@@ -181,6 +183,7 @@ class OpenAPIReferenceResolver:
             reference_pointer,
             expected_target_kind,
             1,
+            direct_pointer,
         )
         direct_hop = _ReferenceHop(
             reference_pointer=reference_pointer,
@@ -227,7 +230,16 @@ class OpenAPIReferenceResolver:
         cache_key = (target_pointer, target_kind)
         cached = self._successful_tails.get(cache_key)
         if cached is not None:
+            self._validate_cached_depth(cached, depth, expected_target_kind)
             return cached
+        if "$dynamicRef" in target:
+            self._raise(
+                ReferenceResolutionErrorCode.OPENAPI_DYNAMIC_REFERENCE_UNSUPPORTED,
+                _child_pointer(target_pointer, "$dynamicRef"),
+                expected_target_kind,
+                canonical_target_pointer=target_pointer,
+                chain_depth=depth + 1,
+            )
         if "$ref" not in target:
             resolved = _CachedTail(target, target_pointer, ())
             self._successful_tails[cache_key] = resolved
@@ -271,7 +283,8 @@ class OpenAPIReferenceResolver:
             target,
             internal_reference_pointer,
             expected_target_kind,
-            depth,
+            depth + 1,
+            direct_pointer,
         )
         direct_target = self._lookup_target(
             direct_pointer,
@@ -429,6 +442,14 @@ class OpenAPIReferenceResolver:
             )
         collection, component_name = tokens[1:]
         target_kind = _COLLECTION_TARGET_KINDS.get(collection)
+        if collection == "pathItems":
+            self._raise(
+                ReferenceResolutionErrorCode.OPENAPI_PATH_ITEM_REFERENCE_UNSUPPORTED,
+                reference_pointer,
+                expected_target_kind,
+                canonical_target_pointer=None,
+                chain_depth=chain_depth,
+            )
         if target_kind is None or not component_name:
             self._raise(
                 ReferenceResolutionErrorCode.OPENAPI_REFERENCE_COMPONENT_POINTER_UNSUPPORTED,
@@ -509,6 +530,7 @@ class OpenAPIReferenceResolver:
         reference_pointer: JsonPointer,
         expected_target_kind: ReferenceTargetKind,
         chain_depth: int,
+        canonical_target_pointer: JsonPointer,
     ) -> tuple[ReferenceMetadataOverride, tuple[OpenAPIContextDiagnostic, ...]]:
         siblings = tuple(key for key in reference_object if key != "$ref")
         if self._openapi_version_family is OpenAPIVersionFamily.OPENAPI_3_0:
@@ -531,7 +553,7 @@ class OpenAPIReferenceResolver:
                     ReferenceResolutionErrorCode.OPENAPI_SCHEMA_REF_SIBLING_UNSUPPORTED,
                     reference_pointer,
                     expected_target_kind,
-                    canonical_target_pointer=None,
+                    canonical_target_pointer=canonical_target_pointer,
                     chain_depth=chain_depth,
                 )
             return (
@@ -544,29 +566,35 @@ class OpenAPIReferenceResolver:
                     for sibling in siblings
                 ),
             )
-        summary = reference_object.get("summary")
-        description = reference_object.get("description")
-        if summary is not None and type(summary) is not str:
+        summary: object | None = None
+        description: object | None = None
+        if "summary" in reference_object:
+            summary = reference_object["summary"]
+        if "description" in reference_object:
+            description = reference_object["description"]
+        if "summary" in reference_object and type(summary) is not str:
             self._raise(
                 ReferenceResolutionErrorCode.OPENAPI_REFERENCE_METADATA_INVALID,
                 reference_pointer,
                 expected_target_kind,
-                canonical_target_pointer=None,
+                canonical_target_pointer=canonical_target_pointer,
                 chain_depth=chain_depth,
             )
-        if description is not None and type(description) is not str:
+        if "description" in reference_object and type(description) is not str:
             self._raise(
                 ReferenceResolutionErrorCode.OPENAPI_REFERENCE_METADATA_INVALID,
                 reference_pointer,
                 expected_target_kind,
-                canonical_target_pointer=None,
+                canonical_target_pointer=canonical_target_pointer,
                 chain_depth=chain_depth,
             )
         ignored_siblings = tuple(
             sibling for sibling in siblings if sibling not in {"summary", "description"}
         )
         return (
-            ReferenceMetadataOverride(summary, description),
+            ReferenceMetadataOverride(
+                cast(str | None, summary), cast(str | None, description)
+            ),
             tuple(
                 _sibling_diagnostic(
                     _child_pointer(_parent_pointer(reference_pointer), sibling),
@@ -610,6 +638,24 @@ class OpenAPIReferenceResolver:
             effective_summary, effective_description
         ), tuple(records)
 
+    def _validate_cached_depth(
+        self,
+        cached: _CachedTail,
+        current_depth: int,
+        expected_target_kind: ReferenceTargetKind,
+    ) -> None:
+        allowed_tail_hops = MAX_REFERENCE_CHAIN_DEPTH - current_depth
+        if len(cached.hops) <= allowed_tail_hops:
+            return
+        overflow_hop = cached.hops[allowed_tail_hops]
+        self._raise(
+            ReferenceResolutionErrorCode.OPENAPI_REFERENCE_DEPTH_EXCEEDED,
+            overflow_hop.reference_pointer,
+            expected_target_kind,
+            canonical_target_pointer=overflow_hop.canonical_target_pointer,
+            chain_depth=MAX_REFERENCE_CHAIN_DEPTH + 1,
+        )
+
     def _raise(
         self,
         code: ReferenceResolutionErrorCode,
@@ -642,7 +688,7 @@ def _evaluate_pointer(root: object, pointer: JsonPointer) -> object:
                 raise _PointerLookupError
             current = mapping[token]
         elif type(current) is list:
-            if not token.isdecimal():
+            if _ARRAY_INDEX_PATTERN.fullmatch(token) is None:
                 raise _PointerLookupError
             index = int(token)
             sequence = cast(list[object], current)

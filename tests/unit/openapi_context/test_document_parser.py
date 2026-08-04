@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from hashlib import sha256
+from typing import Literal, cast
 
 import pytest
 from pydantic import ValidationError
@@ -81,6 +82,15 @@ def test_decodes_utf8_bom_once() -> None:
     assert decoded.text == '{"openapi":"3.1.0"}'
     assert decoded.encoding == "utf-8"
     assert decoded.had_utf8_bom
+
+
+def test_decoded_document_encoding_is_fixed_to_utf8() -> None:
+    with pytest.raises(ValidationError):
+        DecodedOpenAPIDocument(
+            text="{}",
+            encoding=cast(Literal["utf-8"], "gbk"),
+            had_utf8_bom=False,
+        )
 
 
 @pytest.mark.parametrize(
@@ -230,6 +240,24 @@ def test_yaml_rejects_non_json_compatible_values(raw_document: bytes) -> None:
 @pytest.mark.parametrize(
     "raw_document",
     [
+        b"date: 2026-13-40\n",
+        b"date: 2026-02-30\n",
+        b"timestamp: 2001-12-15T02:59:43.1+99:00\n",
+    ],
+)
+def test_yaml_constructor_value_errors_are_stable(raw_document: bytes) -> None:
+    error = assert_error(
+        raw_document,
+        OpenAPIDocumentErrorCode.OPENAPI_DOCUMENT_VALUE_UNSUPPORTED,
+        document_format=OpenAPIDocumentFormat.YAML,
+    )
+    assert "month must be in" not in error.safe_detail
+    assert "offset must be" not in error.safe_detail
+
+
+@pytest.mark.parametrize(
+    "raw_document",
+    [
         b"- item\n",
         b"# comment only\n",
         b"ordinary text\n",
@@ -255,6 +283,42 @@ def test_yaml_aliases_become_independent_plain_containers() -> None:
     assert result.root["base"] == result.root["other"]
     assert result.root["base"] is not result.root["other"]
     assert result.root["value"] == 1.5
+
+
+def test_deep_json_is_mapped_to_a_stable_value_error() -> None:
+    parser = OpenAPIDocumentParser()
+    for depth in range(200, 2_001, 200):
+        raw_document = b'{"root":' + b'{"child":' * depth + b"0" + b"}" * depth + b"}"
+        try:
+            parser.parse(source(raw_document))
+        except OpenAPIDocumentError as error:
+            assert (
+                error.code
+                is OpenAPIDocumentErrorCode.OPENAPI_DOCUMENT_VALUE_UNSUPPORTED
+            )
+            assert error.document_format is OpenAPIDocumentFormat.JSON
+            return
+    pytest.fail("Expected a bounded deep JSON input to reach a recursion boundary.")
+
+
+def test_deep_yaml_is_mapped_to_a_stable_value_error() -> None:
+    parser = OpenAPIDocumentParser()
+    for depth in range(100, 1_201, 100):
+        lines = ["root:"]
+        lines.extend(f"{'  ' * level}child:" for level in range(1, depth + 1))
+        lines.append(f"{'  ' * (depth + 1)}value: end")
+        raw_document = ("\n".join(lines) + "\n").encode()
+        assert len(raw_document) < 2 * 1024 * 1024
+        try:
+            parser.parse(source(raw_document))
+        except OpenAPIDocumentError as error:
+            assert (
+                error.code
+                is OpenAPIDocumentErrorCode.OPENAPI_DOCUMENT_VALUE_UNSUPPORTED
+            )
+            assert error.document_format is OpenAPIDocumentFormat.YAML
+            return
+    pytest.fail("Expected a bounded deep YAML input to reach a recursion boundary.")
 
 
 @pytest.mark.parametrize(

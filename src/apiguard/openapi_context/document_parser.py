@@ -3,7 +3,7 @@
 import json
 import math
 from enum import StrEnum
-from typing import cast
+from typing import Literal, cast
 
 import yaml
 from pydantic import BaseModel, ConfigDict
@@ -33,7 +33,7 @@ class DecodedOpenAPIDocument(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     text: str
-    encoding: str = "utf-8"
+    encoding: Literal["utf-8"] = "utf-8"
     had_utf8_bom: bool
 
 
@@ -148,6 +148,12 @@ class OpenAPIDocumentParser:
                 source,
                 OpenAPIDocumentFormat.JSON,
             ) from error
+        except RecursionError as error:
+            raise _error(
+                OpenAPIDocumentErrorCode.OPENAPI_DOCUMENT_VALUE_UNSUPPORTED,
+                source,
+                OpenAPIDocumentFormat.JSON,
+            ) from error
         except json.JSONDecodeError:
             return self._parse_yaml(source, decoded.text)
         return self._parsed_result(source, parsed, OpenAPIDocumentFormat.JSON)
@@ -175,6 +181,12 @@ class OpenAPIDocumentParser:
                 source,
                 OpenAPIDocumentFormat.YAML,
             ) from error
+        except (ValueError, OverflowError, RecursionError) as error:
+            raise _error(
+                OpenAPIDocumentErrorCode.OPENAPI_DOCUMENT_VALUE_UNSUPPORTED,
+                source,
+                OpenAPIDocumentFormat.YAML,
+            ) from error
         except yaml.YAMLError as error:
             raise _error(
                 OpenAPIDocumentErrorCode.OPENAPI_DOCUMENT_SYNTAX_INVALID,
@@ -191,7 +203,7 @@ class OpenAPIDocumentParser:
     ) -> ParsedOpenAPIDocument:
         try:
             normalized = _normalize_json_value(parsed, set())
-        except _UnsupportedValueError as error:
+        except (_UnsupportedValueError, RecursionError) as error:
             raise _error(
                 OpenAPIDocumentErrorCode.OPENAPI_DOCUMENT_VALUE_UNSUPPORTED,
                 source,
@@ -204,7 +216,7 @@ class OpenAPIDocumentParser:
                 document_format,
             )
         version = normalized.get("openapi")
-        return ParsedOpenAPIDocument(
+        return ParsedOpenAPIDocument.model_construct(
             document_format=document_format,
             root=normalized,
             declared_openapi_version=version if isinstance(version, str) else None,

@@ -335,7 +335,7 @@ def test_identity_version_metadata_and_operation_key_contracts() -> None:
         size_bytes=1,
     )
     assert_invalid(RawDocumentIdentity, content_sha256="a" * 64, size_bytes=0)
-    for version in ["3.1", "2.0.0", "3.2.0", "3.1.x"]:
+    for version in ["3.1", "2.0.0", "3.2.0", "3.1.x", "3.1.١", "3.1.１"]:
         assert_invalid(
             OpenAPIVersion,
             family=OpenAPIVersionFamily.OPENAPI_3_1,
@@ -401,6 +401,61 @@ def test_parameter_serialization_and_path_parameter_contracts(
             "location": ParameterLocation.QUERY,
             "serialization": {"style": "SIMPLE", "explode": False},
         },
+    )
+
+
+@pytest.mark.parametrize("invalid_value", [0, 0.0, 1, "false", None, True])
+def test_fixed_false_fields_reject_non_boolean_false(invalid_value: object) -> None:
+    assert_invalid(
+        ParameterSerializationContext,
+        style=ParameterStyle.SIMPLE,
+        explode=False,
+        allow_reserved=invalid_value,
+    )
+    assert_invalid(
+        SuggestedValueContext,
+        kind=SuggestedValueKind.EXAMPLE,
+        value="example",
+        source_pointer="/example",
+        authoritative=invalid_value,
+    )
+    assert_invalid(
+        ServerCandidateContext,
+        url_template="https://example.test",
+        description=None,
+        variables=(),
+        authoritative_for_execution=invalid_value,
+    )
+
+
+def test_fixed_false_fields_accept_false_defaults_and_json_false() -> None:
+    assert (
+        ParameterSerializationContext(
+            style=ParameterStyle.SIMPLE, explode=False
+        ).allow_reserved
+        is False
+    )
+    assert (
+        SuggestedValueContext(
+            kind=SuggestedValueKind.EXAMPLE,
+            value="example",
+            source_pointer="/example",
+        ).authoritative
+        is False
+    )
+    assert (
+        ServerCandidateContext(
+            url_template="https://example.test",
+            description=None,
+            variables=(),
+        ).authoritative_for_execution
+        is False
+    )
+    assert (
+        ParameterSerializationContext.model_validate_json(
+            '{"style":"SIMPLE","explode":false,"allow_reserved":false}'
+        ).allow_reserved
+        is False
     )
 
 
@@ -504,6 +559,43 @@ def test_media_request_body_and_response_content_sorting_contracts() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "normalized_value",
+    [
+        "application/problem+json",
+        "application/vnd.example+json",
+        "application/vnd.company.resource-v2+json",
+    ],
+)
+def test_structured_json_media_types_require_a_valid_subtype(
+    normalized_value: str,
+) -> None:
+    assert MediaTypeContext(
+        declared_value=normalized_value,
+        normalized_value=normalized_value,
+        match_kind=JsonMediaTypeMatchKind.STRUCTURED_JSON_SUFFIX,
+    )
+    assert MediaTypeContext(
+        declared_value="application/*+json",
+        normalized_value="application/*+json",
+        match_kind=JsonMediaTypeMatchKind.STRUCTURED_JSON_SUFFIX_WILDCARD,
+    )
+    for invalid_value in [
+        "application/+json",
+        "application/*foo+json",
+        "application//vendor+json",
+        "application/vendor+json/extra",
+        "text/problem+json",
+        "application/vendor json+json",
+    ]:
+        assert_invalid(
+            MediaTypeContext,
+            declared_value=invalid_value,
+            normalized_value=invalid_value,
+            match_kind=JsonMediaTypeMatchKind.STRUCTURED_JSON_SUFFIX,
+        )
+
+
 def test_schema_constraints_and_all_schema_kinds() -> None:
     scalar_kinds = [
         SchemaKind.ANY,
@@ -562,6 +654,20 @@ def test_schema_values_are_frozen_unique_and_json_round_trip() -> None:
         SchemaContext,
         **{**schema.model_dump(), "enum_values": [{"same": 1}, {"same": 1}]},
     )
+    assert_invalid(
+        SchemaContext,
+        **{**schema.model_dump(), "enum_values": [1, 1.0]},
+    )
+    assert_invalid(
+        SchemaContext,
+        **{
+            **schema.model_dump(),
+            "enum_values": [{"value": 1}, {"value": 1.0}],
+        },
+    )
+    assert schema_context(enum_values=(False, 0))
+    assert schema_context(enum_values=(True, 1))
+    assert schema_context(enum_values=(1, 2.0))
 
 
 def test_security_server_diagnostics_and_references_have_contract_invariants() -> None:

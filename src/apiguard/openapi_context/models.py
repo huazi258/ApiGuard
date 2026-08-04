@@ -37,10 +37,14 @@ warnings.filterwarnings(
         'Field name "schema" in ".*" shadows an attribute in parent "_ContextModel"'
     ),
     category=UserWarning,
+    module=r"^apiguard\.openapi_context\.models$",
 )
 
 _MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
-_VERSION_PATTERN = re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)\.\d+$")
+_VERSION_PATTERN = re.compile(r"^(?P<major>[0-9]+)\.(?P<minor>[0-9]+)\.[0-9]+$")
+_STRUCTURED_JSON_MEDIA_TYPE_PATTERN = re.compile(
+    r"application/[!#$%&'+\-.^_`|~0-9a-z]+\+json$", re.ASCII
+)
 _METHOD_ORDER = {
     HttpMethod.GET: 0,
     HttpMethod.HEAD: 1,
@@ -156,9 +160,9 @@ def _json_value_key(value: object) -> object:
     if type(value) is bool:
         return ("bool", value)
     if type(value) is int:
-        return ("int", value)
+        return ("number", value)
     if type(value) is float:
-        return ("float", value)
+        return ("number", value)
     return ("string", value)
 
 
@@ -178,6 +182,12 @@ def _to_snapshot_id(value: str) -> OpenAPIContextSnapshotId:
     return OpenAPIContextSnapshotId(value)
 
 
+def _require_exact_false(value: object) -> bool:
+    if type(value) is not bool or value is not False:
+        raise ValueError("This field must be exactly false.")
+    return False
+
+
 type ContextJsonValue = Annotated[
     object,
     BeforeValidator(_freeze_json_value),
@@ -189,6 +199,7 @@ type SourcePointer = Annotated[
     PlainSerializer(_serialize_json_pointer, return_type=str),
 ]
 type SnapshotId = Annotated[StrictStr, AfterValidator(_to_snapshot_id)]
+type StrictFalse = Annotated[Literal[False], BeforeValidator(_require_exact_false)]
 type NonEmptyString = Annotated[StrictStr, Field(min_length=1)]
 type Sha256 = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")]
 
@@ -312,14 +323,14 @@ class SuggestedValueKind(StrEnum):
 class ParameterSerializationContext(_ContextModel):
     style: ParameterStyle
     explode: StrictBool
-    allow_reserved: Literal[False] = False
+    allow_reserved: StrictFalse = False
 
 
 class SuggestedValueContext(_ContextModel):
     kind: SuggestedValueKind
     value: ContextJsonValue
     source_pointer: SourcePointer
-    authoritative: Literal[False] = False
+    authoritative: StrictFalse = False
 
 
 class JsonMediaTypeMatchKind(StrEnum):
@@ -345,10 +356,8 @@ class MediaTypeContext(_ContextModel):
         if self.match_kind is JsonMediaTypeMatchKind.EXACT_JSON:
             is_valid = self.normalized_value == "application/json"
         elif self.match_kind is JsonMediaTypeMatchKind.STRUCTURED_JSON_SUFFIX:
-            is_valid = (
-                self.normalized_value.startswith("application/")
-                and self.normalized_value.endswith("+json")
-                and self.normalized_value != "application/*+json"
+            is_valid = bool(
+                _STRUCTURED_JSON_MEDIA_TYPE_PATTERN.fullmatch(self.normalized_value)
             )
         else:
             is_valid = self.normalized_value == "application/*+json"
@@ -661,7 +670,7 @@ class ServerCandidateContext(_ContextModel):
     url_template: NonEmptyString
     description: StrictStr | None
     variables: tuple[ServerVariableContext, ...]
-    authoritative_for_execution: Literal[False] = False
+    authoritative_for_execution: StrictFalse = False
 
     @model_validator(mode="after")
     def validate_variables(self) -> ServerCandidateContext:

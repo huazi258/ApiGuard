@@ -497,6 +497,56 @@ def test_internal_dynamic_references_and_null_metadata_are_stable() -> None:
     assert error.chain_depth == 2
 
 
+@pytest.mark.parametrize(
+    ("family", "target_kind", "reference"),
+    [
+        (
+            OpenAPIVersionFamily.OPENAPI_3_0,
+            ReferenceTargetKind.RESPONSE,
+            "#/components/responses/Order",
+        ),
+        (
+            OpenAPIVersionFamily.OPENAPI_3_1,
+            ReferenceTargetKind.RESPONSE,
+            "#/components/responses/Order",
+        ),
+        (
+            OpenAPIVersionFamily.OPENAPI_3_1,
+            ReferenceTargetKind.SCHEMA,
+            "#/components/schemas/Order",
+        ),
+    ],
+)
+def test_use_site_dynamic_reference_sibling_is_never_ignored(
+    family: OpenAPIVersionFamily,
+    target_kind: ReferenceTargetKind,
+    reference: str,
+) -> None:
+    root = document()
+    value, pointer = add_use(
+        root,
+        "dynamic-sibling",
+        reference,
+        **{"$dynamicRef": "not-followed"},
+    )
+    before = deepcopy(root)
+
+    error = assert_error(
+        root,
+        value,
+        pointer,
+        target_kind,
+        ReferenceResolutionErrorCode.OPENAPI_DYNAMIC_REFERENCE_UNSUPPORTED,
+        ReferenceResolutionFailureCategory.UNSUPPORTED_FEATURE,
+        family=family,
+        expected_reference_pointer=JsonPointer("/uses/dynamic-sibling/$dynamicRef"),
+    )
+
+    assert error.canonical_target_pointer == JsonPointer(reference[1:])
+    assert error.chain_depth == 1
+    assert root == before
+
+
 def test_internal_schema_siblings_array_indexes_and_component_path_items() -> None:
     root = document()
     root["components"]["schemas"] = {

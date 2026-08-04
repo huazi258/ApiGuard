@@ -171,6 +171,15 @@ class OpenAPIReferenceResolver:
         direct_pointer, target_kind = self._parse_component_reference(
             original_reference, reference_pointer, expected_target_kind, 1
         )
+        reference_object = self._parent_mapping(reference_pointer, expected_target_kind)
+        if "$dynamicRef" in reference_object:
+            self._raise(
+                ReferenceResolutionErrorCode.OPENAPI_DYNAMIC_REFERENCE_UNSUPPORTED,
+                _child_pointer(_parent_pointer(reference_pointer), "$dynamicRef"),
+                expected_target_kind,
+                canonical_target_pointer=direct_pointer,
+                chain_depth=1,
+            )
         target = self._lookup_target(
             direct_pointer,
             target_kind,
@@ -179,7 +188,7 @@ class OpenAPIReferenceResolver:
             1,
         )
         metadata, diagnostics = self._inspect_siblings(
-            self._parent_mapping(reference_pointer, expected_target_kind),
+            reference_object,
             reference_pointer,
             expected_target_kind,
             1,

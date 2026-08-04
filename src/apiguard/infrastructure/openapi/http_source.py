@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import suppress
 from hashlib import sha256
+from threading import Event, Lock
 from time import monotonic
 
 import httpx
@@ -42,14 +43,52 @@ class _RemoteReadFailure(Exception):
         self.cause = cause
 
 
+class _AttemptProgress:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._bytes_received = 0
+        self._client: httpx.Client | None = None
+        self._response: httpx.Response | None = None
+        self.cancelled = Event()
+
+    @property
+    def bytes_received(self) -> int:
+        with self._lock:
+            return self._bytes_received
+
+    def add_bytes(self, size: int) -> int:
+        with self._lock:
+            self._bytes_received += size
+            return self._bytes_received
+
+    def set_client(self, client: httpx.Client) -> None:
+        with self._lock:
+            self._client = client
+
+    def set_response(self, response: httpx.Response) -> None:
+        with self._lock:
+            self._response = response
+
+    def cancel_and_close(self) -> None:
+        self.cancelled.set()
+        with self._lock:
+            response = self._response
+            client = self._client
+        if response is not None:
+            with suppress(httpx.HTTPError):
+                response.close()
+        if client is not None:
+            with suppress(httpx.HTTPError):
+                client.close()
+
+
 class HttpOpenAPISource:
     """Read a remote OpenAPI document with frozen transport and size budgets."""
 
     def __init__(
         self,
-        client: httpx.Client | None = None,
         *,
-        monotonic_clock: Callable[[], float] = monotonic,
+        client_factory: Callable[[], httpx.Client] | None = None,
         timeout_seconds: float | None = None,
         max_attempts: int | None = None,
         max_bytes: int | None = None,
@@ -74,14 +113,7 @@ class HttpOpenAPISource:
             raise ValueError("max_attempts must be between one and two.")
         if self._max_bytes <= 0:
             raise ValueError("max_bytes must be greater than zero.")
-        self._clock = monotonic_clock
-        self._owns_client = client is None
-        self._client = client or httpx.Client(follow_redirects=False, trust_env=False)
-
-    def close(self) -> None:
-        """Close only a client that this adapter created."""
-        if self._owns_client:
-            self._client.close()
+        self._client_factory = client_factory or _default_client_factory
 
     def read(self, descriptor: OpenAPISourceDescriptor) -> OpenAPISourceReadResult:
         if descriptor.kind is not OpenAPISourceKind.REMOTE_HTTP:
@@ -91,7 +123,7 @@ class HttpOpenAPISource:
                 (
                     self._failed_attempt(
                         1,
-                        self._clock(),
+                        monotonic(),
                         0,
                         OpenAPISourceErrorCode.UNSUPPORTED_OPENAPI_SOURCE,
                         retryable=False,
@@ -101,9 +133,9 @@ class HttpOpenAPISource:
 
         attempts: list[OpenAPISourceReadAttempt] = []
         for attempt_no in range(1, self._max_attempts + 1):
-            started = self._clock()
+            started = monotonic()
             try:
-                raw_document, content_type = self._read_once(descriptor, started)
+                raw_document, content_type = self._run_attempt(descriptor)
             except _RemoteReadFailure as failure:
                 should_retry = failure.retryable and attempt_no < self._max_attempts
                 attempts.append(
@@ -141,63 +173,54 @@ class HttpOpenAPISource:
             )
         raise AssertionError("A bounded remote source read must return or raise.")
 
-    def _read_once(
-        self, descriptor: OpenAPISourceDescriptor, started: float
+    def _run_attempt(
+        self, descriptor: OpenAPISourceDescriptor
     ) -> tuple[bytes, str | None]:
-        deadline = started + self._timeout_seconds
-        response: httpx.Response | None = None
-        received = 0
+        progress = _AttemptProgress()
+        executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="apiguard-openapi-attempt"
+        )
+        future = executor.submit(self._read_in_worker, descriptor, progress)
         try:
+            try:
+                return future.result(timeout=self._timeout_seconds)
+            except FutureTimeoutError as error:
+                progress.cancel_and_close()
+                with suppress(_RemoteReadFailure, httpx.HTTPError):
+                    future.result()
+                raise _RemoteReadFailure(
+                    OpenAPISourceErrorCode.OPENAPI_FETCH_TIMEOUT,
+                    retryable=True,
+                    bytes_received=progress.bytes_received,
+                    cause=error,
+                ) from error
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def _read_in_worker(
+        self, descriptor: OpenAPISourceDescriptor, progress: _AttemptProgress
+    ) -> tuple[bytes, str | None]:
+        response: httpx.Response | None = None
+        client: httpx.Client | None = None
+        try:
+            client = self._client_factory()
+            progress.set_client(client)
+            self._raise_if_cancelled(progress)
             request = httpx.Request(
                 "GET",
                 descriptor.location,
                 headers={"Accept": _ACCEPT_HEADER},
-                extensions={"timeout": {}},
+                extensions={"timeout": httpx.Timeout(self._timeout_seconds).as_dict()},
             )
-            self._set_timeout(request, self._remaining(deadline, received))
-            response = self._client.send(
+            response = client.send(
                 request,
                 stream=True,
                 auth=None,
                 follow_redirects=False,
             )
-            self._set_timeout(request, self._remaining(deadline, received))
-            if response.status_code in _REDIRECT_STATUS_CODES:
-                raise _RemoteReadFailure(
-                    OpenAPISourceErrorCode.OPENAPI_REDIRECT_NOT_ALLOWED,
-                    retryable=False,
-                    bytes_received=0,
-                )
-            if response.status_code in {401, 403}:
-                raise _RemoteReadFailure(
-                    OpenAPISourceErrorCode.OPENAPI_SOURCE_ACCESS_DENIED,
-                    retryable=False,
-                    bytes_received=0,
-                )
-            if response.status_code in {404, 410}:
-                raise _RemoteReadFailure(
-                    OpenAPISourceErrorCode.OPENAPI_SOURCE_NOT_FOUND,
-                    retryable=False,
-                    bytes_received=0,
-                )
-            if response.status_code in _RETRYABLE_STATUS_CODES:
-                raise _RemoteReadFailure(
-                    OpenAPISourceErrorCode.OPENAPI_SOURCE_UNAVAILABLE,
-                    retryable=True,
-                    bytes_received=0,
-                )
-            if not 200 <= response.status_code <= 299:
-                raise _RemoteReadFailure(
-                    OpenAPISourceErrorCode.OPENAPI_SOURCE_HTTP_ERROR,
-                    retryable=False,
-                    bytes_received=0,
-                )
-            if response.status_code == 204:
-                raise _RemoteReadFailure(
-                    OpenAPISourceErrorCode.OPENAPI_SOURCE_EMPTY,
-                    retryable=False,
-                    bytes_received=0,
-                )
+            progress.set_response(response)
+            self._raise_if_cancelled(progress)
+            self._validate_response(response)
             content_length = _content_length(response)
             if content_length is not None and content_length > self._max_bytes:
                 raise _RemoteReadFailure(
@@ -206,22 +229,18 @@ class HttpOpenAPISource:
                     bytes_received=0,
                 )
             chunks: list[bytes] = []
-            body = iter(response.iter_bytes())
-            while True:
-                self._set_timeout(request, self._remaining(deadline, received))
-                chunk = self._read_next_chunk(body, response, deadline, received)
-                if chunk is None:
-                    break
-                received += len(chunk)
-                self._remaining(deadline, received)
+            body: Iterator[bytes] = iter(response.iter_bytes())
+            for chunk in body:
+                received = progress.add_bytes(len(chunk))
                 if received > self._max_bytes:
                     raise _RemoteReadFailure(
                         OpenAPISourceErrorCode.OPENAPI_DOCUMENT_TOO_LARGE,
                         retryable=False,
                         bytes_received=received,
                     )
+                self._raise_if_cancelled(progress)
                 chunks.append(chunk)
-            self._remaining(deadline, received)
+            self._raise_if_cancelled(progress)
             raw_document = b"".join(chunks)
             if not raw_document:
                 raise _RemoteReadFailure(
@@ -236,14 +255,14 @@ class HttpOpenAPISource:
             raise _RemoteReadFailure(
                 OpenAPISourceErrorCode.INVALID_OPENAPI_SOURCE_LOCATION,
                 retryable=False,
-                bytes_received=received,
+                bytes_received=progress.bytes_received,
                 cause=error,
             ) from error
         except httpx.TimeoutException as error:
             raise _RemoteReadFailure(
                 OpenAPISourceErrorCode.OPENAPI_FETCH_TIMEOUT,
                 retryable=True,
-                bytes_received=received,
+                bytes_received=progress.bytes_received,
                 cause=error,
             ) from error
         except (
@@ -255,85 +274,93 @@ class HttpOpenAPISource:
             raise _RemoteReadFailure(
                 OpenAPISourceErrorCode.OPENAPI_SOURCE_UNAVAILABLE,
                 retryable=not _has_ssl_error(error),
-                bytes_received=received,
+                bytes_received=progress.bytes_received,
                 cause=error,
             ) from error
         except (httpx.DecodingError, httpx.LocalProtocolError) as error:
             raise _RemoteReadFailure(
                 OpenAPISourceErrorCode.OPENAPI_SOURCE_READ_FAILED,
                 retryable=False,
-                bytes_received=received,
+                bytes_received=progress.bytes_received,
                 cause=error,
             ) from error
         except httpx.ProxyError as error:
             raise _RemoteReadFailure(
                 OpenAPISourceErrorCode.OPENAPI_SOURCE_UNAVAILABLE,
                 retryable=False,
-                bytes_received=received,
+                bytes_received=progress.bytes_received,
                 cause=error,
             ) from error
         except httpx.UnsupportedProtocol as error:
             raise _RemoteReadFailure(
                 OpenAPISourceErrorCode.INVALID_OPENAPI_SOURCE_LOCATION,
                 retryable=False,
-                bytes_received=received,
+                bytes_received=progress.bytes_received,
                 cause=error,
             ) from error
         except httpx.HTTPError as error:
             raise _RemoteReadFailure(
                 OpenAPISourceErrorCode.OPENAPI_SOURCE_UNAVAILABLE,
                 retryable=False,
-                bytes_received=received,
+                bytes_received=progress.bytes_received,
                 cause=error,
             ) from error
         finally:
             if response is not None:
                 with suppress(httpx.HTTPError):
                     response.close()
+            if client is not None:
+                with suppress(httpx.HTTPError):
+                    client.close()
 
-    def _remaining(self, deadline: float, bytes_received: int) -> float:
-        remaining = deadline - self._clock()
-        if remaining <= 0:
+    def _validate_response(self, response: httpx.Response) -> None:
+        if response.status_code in _REDIRECT_STATUS_CODES:
+            raise _RemoteReadFailure(
+                OpenAPISourceErrorCode.OPENAPI_REDIRECT_NOT_ALLOWED,
+                retryable=False,
+                bytes_received=0,
+            )
+        if response.status_code in {401, 403}:
+            raise _RemoteReadFailure(
+                OpenAPISourceErrorCode.OPENAPI_SOURCE_ACCESS_DENIED,
+                retryable=False,
+                bytes_received=0,
+            )
+        if response.status_code in {404, 410}:
+            raise _RemoteReadFailure(
+                OpenAPISourceErrorCode.OPENAPI_SOURCE_NOT_FOUND,
+                retryable=False,
+                bytes_received=0,
+            )
+        if response.status_code in _RETRYABLE_STATUS_CODES:
+            raise _RemoteReadFailure(
+                OpenAPISourceErrorCode.OPENAPI_SOURCE_UNAVAILABLE,
+                retryable=True,
+                bytes_received=0,
+            )
+        if not 200 <= response.status_code <= 299:
+            raise _RemoteReadFailure(
+                OpenAPISourceErrorCode.OPENAPI_SOURCE_HTTP_ERROR,
+                retryable=False,
+                bytes_received=0,
+            )
+        if response.status_code == 204:
+            raise _RemoteReadFailure(
+                OpenAPISourceErrorCode.OPENAPI_SOURCE_EMPTY,
+                retryable=False,
+                bytes_received=0,
+            )
+
+    def _raise_if_cancelled(self, progress: _AttemptProgress) -> None:
+        if progress.cancelled.is_set():
             raise _RemoteReadFailure(
                 OpenAPISourceErrorCode.OPENAPI_FETCH_TIMEOUT,
                 retryable=True,
-                bytes_received=bytes_received,
+                bytes_received=progress.bytes_received,
             )
-        return remaining
 
     def _elapsed_ms(self, started: float) -> int:
-        return max(0, int((self._clock() - started) * 1000))
-
-    def _read_next_chunk(
-        self,
-        body: Iterator[bytes],
-        response: httpx.Response,
-        deadline: float,
-        bytes_received: int,
-    ) -> bytes | None:
-        executor = ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(next, body)
-        try:
-            try:
-                return future.result(timeout=self._remaining(deadline, bytes_received))
-            except StopIteration:
-                return None
-            except FutureTimeoutError as error:
-                with suppress(httpx.HTTPError):
-                    response.close()
-                with suppress(StopIteration, httpx.HTTPError):
-                    future.result()
-                raise _RemoteReadFailure(
-                    OpenAPISourceErrorCode.OPENAPI_FETCH_TIMEOUT,
-                    retryable=True,
-                    bytes_received=bytes_received,
-                    cause=error,
-                ) from error
-        finally:
-            executor.shutdown(wait=True, cancel_futures=True)
-
-    def _set_timeout(self, request: httpx.Request, remaining: float) -> None:
-        request.extensions["timeout"] = httpx.Timeout(remaining).as_dict()
+        return max(0, int((monotonic() - started) * 1000))
 
     def _failed_attempt(
         self,
@@ -369,6 +396,10 @@ class HttpOpenAPISource:
             retryable=False,
             safe_detail="Remote OpenAPI source could not be read.",
         )
+
+
+def _default_client_factory() -> httpx.Client:
+    return httpx.Client(follow_redirects=False, trust_env=False)
 
 
 def _content_length(response: httpx.Response) -> int | None:

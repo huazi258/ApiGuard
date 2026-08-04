@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Event, Thread
+from threading import enumerate as enumerate_threads
 from time import monotonic, sleep
 from typing import NotRequired, TypedDict, Unpack
 
@@ -24,17 +25,6 @@ from apiguard.openapi_context.source import (
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 
 
-class FakeClock:
-    def __init__(self) -> None:
-        self.value = 0.0
-
-    def __call__(self) -> float:
-        return self.value
-
-    def advance(self, seconds: float) -> None:
-        self.value += seconds
-
-
 class RaisingStream(httpx.SyncByteStream):
     def __init__(
         self, chunks: tuple[bytes, ...], error: httpx.HTTPError | None = None
@@ -51,21 +41,7 @@ class RaisingStream(httpx.SyncByteStream):
         pass
 
 
-class AdvancingStream(httpx.SyncByteStream):
-    def __init__(self, clock: FakeClock, seconds: float) -> None:
-        self._clock = clock
-        self._seconds = seconds
-
-    def __iter__(self) -> Iterator[bytes]:
-        self._clock.advance(self._seconds)
-        yield b"x"
-
-    def close(self) -> None:
-        pass
-
-
 class SourceOptions(TypedDict):
-    monotonic_clock: NotRequired[Callable[[], float]]
     timeout_seconds: NotRequired[float]
     max_attempts: NotRequired[int]
     max_bytes: NotRequired[int]
@@ -96,6 +72,25 @@ class DelayedChunkHandler(BaseHTTPRequestHandler):
         pass
 
 
+class DelayedHeaderHandler(BaseHTTPRequestHandler):
+    completed: Event
+
+    def do_GET(self) -> None:  # noqa: N802
+        sleep(1.0)
+        try:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"late")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            self.completed.set()
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
 def descriptor(
     location: str = "https://example.test/openapi.json",
 ) -> OpenAPISourceDescriptor:
@@ -108,7 +103,8 @@ def source_for(
     handler: Callable[[httpx.Request], httpx.Response], **kwargs: Unpack[SourceOptions]
 ) -> HttpOpenAPISource:
     return HttpOpenAPISource(
-        httpx.Client(transport=httpx.MockTransport(handler)), **kwargs
+        client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)),
+        **kwargs,
     )
 
 
@@ -154,7 +150,7 @@ def test_never_sends_client_credentials_or_cookies() -> None:
         headers={"Authorization": "Bearer secret", "X-API-Key": "key"},
         cookies={"session": "secret"},
     )
-    HttpOpenAPISource(client).read(descriptor())
+    HttpOpenAPISource(client_factory=lambda: client).read(descriptor())
 
 
 @pytest.mark.parametrize("status_code", [204, 200])
@@ -430,39 +426,22 @@ def test_invalid_url_is_a_stable_source_error() -> None:
     assert len(error.value.attempts) == 1
 
 
-def test_deadline_covers_response_body_without_resetting_per_chunk() -> None:
-    clock = FakeClock()
-    request_count = 0
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal request_count
-        request_count += 1
-        requests.append(request)
-        if request_count == 1:
-            clock.advance(9)
-            return httpx.Response(200, stream=AdvancingStream(clock, 2))
-        return httpx.Response(200, content=b"complete")
-
-    result = source_for(handler, monotonic_clock=clock, timeout_seconds=10).read(
-        descriptor()
-    )
-    assert result.raw_document == b"complete"
-    assert result.attempts[0].outcome is OpenAPISourceAttemptOutcome.FAILED_RETRYABLE
-    assert request_count == 2
-    assert requests[0].extensions["timeout"]["read"] == 1
-
-
 def test_deadline_interrupts_a_blocking_loopback_body_read() -> None:
     DelayedChunkHandler.first_chunk_sent = Event()
     DelayedChunkHandler.completed = Event()
     server = ThreadingHTTPServer(("127.0.0.1", 0), DelayedChunkHandler)
+    server.daemon_threads = True
     server_thread = Thread(target=server.serve_forever)
     server_thread.start()
     try:
         port = server.server_address[1]
-        client = httpx.Client(follow_redirects=False, trust_env=False)
-        source = HttpOpenAPISource(client, timeout_seconds=0.5, max_attempts=1)
+        source = HttpOpenAPISource(
+            client_factory=lambda: httpx.Client(
+                follow_redirects=False, trust_env=False
+            ),
+            timeout_seconds=0.5,
+            max_attempts=1,
+        )
         started = monotonic()
         with pytest.raises(OpenAPISourceError) as error:
             source.read(descriptor(f"http://127.0.0.1:{port}/openapi.json"))
@@ -471,9 +450,88 @@ def test_deadline_interrupts_a_blocking_loopback_body_read() -> None:
         assert error.value.code is OpenAPISourceErrorCode.OPENAPI_FETCH_TIMEOUT
         assert error.value.attempts[0].bytes_received == len(b"first")
         assert elapsed < 0.9
-        client.close()
     finally:
         DelayedChunkHandler.completed.wait(timeout=2)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+    assert not server_thread.is_alive()
+    assert not any(
+        thread.name.startswith("apiguard-openapi-attempt")
+        for thread in enumerate_threads()
+    )
+
+
+def test_deadline_interrupts_a_blocking_loopback_response_header_wait() -> None:
+    DelayedHeaderHandler.completed = Event()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), DelayedHeaderHandler)
+    server.daemon_threads = True
+    server_thread = Thread(target=server.serve_forever)
+    server_thread.start()
+    try:
+        port = server.server_address[1]
+        source = HttpOpenAPISource(
+            client_factory=lambda: httpx.Client(
+                follow_redirects=False, trust_env=False
+            ),
+            timeout_seconds=0.5,
+            max_attempts=1,
+        )
+        started = monotonic()
+        with pytest.raises(OpenAPISourceError) as error:
+            source.read(descriptor(f"http://127.0.0.1:{port}/openapi.json"))
+        assert monotonic() - started < 0.9
+        assert error.value.code is OpenAPISourceErrorCode.OPENAPI_FETCH_TIMEOUT
+        assert (
+            error.value.attempts[0].outcome is OpenAPISourceAttemptOutcome.FAILED_FINAL
+        )
+        assert error.value.attempts[0].bytes_received == 0
+    finally:
+        DelayedHeaderHandler.completed.wait(timeout=2)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+    assert not server_thread.is_alive()
+    assert not any(
+        thread.name.startswith("apiguard-openapi-attempt")
+        for thread in enumerate_threads()
+    )
+
+
+def test_retries_response_header_timeout_with_a_new_client() -> None:
+    DelayedHeaderHandler.completed = Event()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), DelayedHeaderHandler)
+    server.daemon_threads = True
+    server_thread = Thread(target=server.serve_forever)
+    server_thread.start()
+    clients: list[httpx.Client] = []
+    try:
+        port = server.server_address[1]
+
+        def factory() -> httpx.Client:
+            if not clients:
+                client = httpx.Client(follow_redirects=False, trust_env=False)
+            else:
+                client = httpx.Client(
+                    transport=httpx.MockTransport(
+                        lambda _: httpx.Response(200, content=b"second attempt")
+                    )
+                )
+            clients.append(client)
+            return client
+
+        result = HttpOpenAPISource(
+            client_factory=factory, timeout_seconds=0.5, max_attempts=2
+        ).read(descriptor(f"http://127.0.0.1:{port}/openapi.json"))
+        assert result.raw_document == b"second attempt"
+        assert tuple(attempt.outcome.value for attempt in result.attempts) == (
+            "FAILED_RETRYABLE",
+            "SUCCEEDED",
+        )
+        assert len(clients) == 2
+        assert all(client.is_closed for client in clients)
+    finally:
+        DelayedHeaderHandler.completed.wait(timeout=2)
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=2)
@@ -564,15 +622,20 @@ def test_rejects_non_remote_descriptor_without_sending_request() -> None:
     assert error.value.code is OpenAPISourceErrorCode.UNSUPPORTED_OPENAPI_SOURCE
 
 
-def test_closes_only_an_owned_client() -> None:
-    HttpOpenAPISource().close()
-    injected_client = httpx.Client(
-        transport=httpx.MockTransport(lambda _: httpx.Response(200))
-    )
-    injected = HttpOpenAPISource(injected_client)
-    injected.close()
-    assert not injected_client.is_closed
-    injected_client.close()
+def test_closes_each_factory_client_after_a_successful_attempt() -> None:
+    clients: list[httpx.Client] = []
+
+    def factory() -> httpx.Client:
+        client = httpx.Client(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, content=b"ok"))
+        )
+        clients.append(client)
+        return client
+
+    result = HttpOpenAPISource(client_factory=factory).read(descriptor())
+    assert result.raw_document == b"ok"
+    assert len(clients) == 1
+    assert clients[0].is_closed
 
 
 @pytest.mark.parametrize(
